@@ -14,8 +14,8 @@
 #include <vector>
 #include <chrono>
 #include <csignal>
+#include <numeric>
 
-// ROOT Vector Dictionary 자동 생성 보장 매크로
 #ifdef __ROOTCLING__
 #pragma link C++ class std::vector<uint16_t>+;
 #endif
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     int debug_event_id = -1;
     int run_number = 0;
     
-    // [수정 1] GUI의 통제를 받기 위해 기본값을 false로 변경! (-w를 줘야만 true가 됨)
+    // 파형 전체를 저장할지 여부 (기본값 false, Charge는 무조건 저장됨)
     bool save_waveform = false; 
 
     int opt;
@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
             case 'c': config_file = optarg; break;
             case 'r': run_number = std::stoi(optarg); break;
             case 'd': debug_event_id = std::stoi(optarg); break;
-            case 'w': save_waveform = true; break; // 파형 저장 옵션 활성화
+            case 'w': save_waveform = true; break;
         }
     }
 
@@ -91,6 +91,9 @@ int main(int argc, char **argv) {
     TTree *tOut = nullptr;
     EventHeader header;
     std::vector<uint16_t> wave_ch[MAX_CH];
+    
+    // [핵심 추가] 이벤트를 적분한 전하량(Charge)을 저장할 변수
+    double charge_ch[MAX_CH] = {0.0};
 
     if (debug_event_id < 0) {
         fOut = new TFile(output_file.c_str(), "RECREATE");
@@ -111,10 +114,13 @@ int main(int argc, char **argv) {
         tOut->Branch("ExtendedTTT", &header.ExtendedTTT, "ExtendedTTT/l");
         tOut->Branch("ChannelMask", &header.ChannelMask, "ChannelMask/s");
         
-        // [로직 확립] -w 옵션이 켜져 있을 때만 ROOT Tree에 Waveform 브랜치를 만듦
-        if (save_waveform) {
-            for (int i = 0; i < MAX_CH; ++i) {
-                 tOut->Branch(Form("Waveform_CH%d", i), &wave_ch[i]);
+        for (int i = 0; i < MAX_CH; ++i) {
+            // 전하량(Charge) 브랜치는 무조건 생성하여 분석에 활용
+            tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
+            
+            // 파형 배열은 -w 옵션이 있을 때만 생성하여 용량 최적화
+            if (save_waveform) {
+                tOut->Branch(Form("Waveform_CH%d", i), &wave_ch[i]);
             }
         }
     }
@@ -133,30 +139,42 @@ int main(int argc, char **argv) {
         for (int i = 0; i < MAX_CH; ++i) {
             if ((header.ChannelMask >> i) & 1) active_ch++;
             wave_ch[i].clear();
+            charge_ch[i] = 0.0; // 매 이벤트 초기화
         }
 
         size_t wave_len = header.RecordLength * active_ch;
         size_t wave_bytes = wave_len * sizeof(uint16_t);
 
-        // [수정 2 - 제1원리 속도 최적화]
-        // 파형을 저장해야(-w) 하거나, 현재 이벤트가 찾고자 하는 디버그 이벤트(-d)일 때만 디스크에서 파형을 읽어옴.
-        if (save_waveform || (debug_event_id >= 0 && (int)header.EventID == debug_event_id)) {
-            raw_waveform_buffer.resize(wave_len);
-            ifs.read(reinterpret_cast<char *>(raw_waveform_buffer.data()), wave_bytes);
-            processed_bytes += wave_bytes;
+        // Charge 연산을 위해 파형 데이터 읽기
+        raw_waveform_buffer.resize(wave_len);
+        ifs.read(reinterpret_cast<char *>(raw_waveform_buffer.data()), wave_bytes);
+        processed_bytes += wave_bytes;
 
-            int offset = 0;
-            for (int ch = 0; ch < MAX_CH; ++ch) {
-                if ((header.ChannelMask >> ch) & 1) {
-                    wave_ch[ch].assign(raw_waveform_buffer.begin() + offset,
-                                       raw_waveform_buffer.begin() + offset + header.RecordLength);
-                    offset += header.RecordLength;
+        int offset = 0;
+        for (int ch = 0; ch < MAX_CH; ++ch) {
+            if ((header.ChannelMask >> ch) & 1) {
+                uint16_t* trace_ptr = raw_waveform_buffer.data() + offset;
+                size_t trace_len = header.RecordLength;
+
+                // [핵심 로직] 파이썬 MonitorTab과 동일한 방식의 Software DSP 적분
+                if (trace_len > 200) {
+                    double baseline = 0.0;
+                    for(int i = 0; i < 150; ++i) baseline += trace_ptr[i];
+                    baseline /= 150.0;
+
+                    double charge = 0.0;
+                    for(size_t i = 150; i < trace_len; ++i) {
+                        charge += (baseline - trace_ptr[i]);
+                    }
+                    charge_ch[ch] = (charge > 0) ? charge : 0.0;
                 }
+
+                // 파형을 ROOT 파일에 기록해야 하거나, 캔버스 디버깅 모드일 때만 벡터 복사
+                if (save_waveform || (debug_event_id >= 0 && (int)header.EventID == debug_event_id)) {
+                    wave_ch[ch].assign(trace_ptr, trace_ptr + trace_len);
+                }
+                offset += trace_len;
             }
-        } else {
-            // 파형도 필요 없고 디버깅 대상도 아니라면, 무거운 I/O 없이 파일 포인터만 점프! (변환 속도 10배 상승)
-            ifs.seekg(wave_bytes, std::ios::cur);
-            processed_bytes += wave_bytes;
         }
 
         if (tOut) tOut->Fill();
@@ -174,7 +192,6 @@ int main(int argc, char **argv) {
                       << "ETA: " << (int)eta_sec << " s" << std::flush;
         }
 
-        // 특정 이벤트 대화형 디버깅 (-d 옵션)
         if (debug_event_id >= 0 && (int)header.EventID == debug_event_id && active_ch > 0) {
             int disp_ch = 0;
             for (; disp_ch < MAX_CH; ++disp_ch) {
@@ -186,13 +203,13 @@ int main(int argc, char **argv) {
                 y[i] = wave_ch[disp_ch][i];
             }
             TGraph *gr = new TGraph(header.RecordLength, x.data(), y.data());
-            gr->SetTitle(Form("Event %d (CH%d);Sample Index;ADC Value", debug_event_id, disp_ch));
+            gr->SetTitle(Form("Event %d (CH%d) - Charge: %.1f;Sample Index;ADC Value", debug_event_id, disp_ch, charge_ch[disp_ch]));
             gr->SetLineColor(kBlue);
             gr->Draw("AL");
             c1->Update();
             std::cout << "\n[Debugger] Displaying Event " << debug_event_id << " CH" << disp_ch << " (Close window to exit)\n";
             app->Run(true);
-            break; // 해당 이벤트 확인이 끝나면 안전하게 종료
+            break; 
         }
     }
 
