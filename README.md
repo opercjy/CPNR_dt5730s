@@ -41,7 +41,7 @@
 
 * **OS:** Linux (Rocky Linux 8/9, CentOS 7, Ubuntu 20.04+ recommended)
 * **Libraries (C++):** 
-  * CAENDigitizer, CAENComm, CAENVMELib
+  * CAENDigitizer, CAENComm, CAENVMELib, CAENUSBDriver
   * ROOT 6 (built with C++17 지원 플래그)
   * ZeroMQ (`libzmq3-dev`)
 * **Libraries (Python):** 
@@ -52,7 +52,7 @@
 CMake를 활용하여 C++ 백엔드를 빌드함과 동시에, GUI 구동을 위한 Python 모듈들이 `bin/` 디렉토리로 자동 배포(Deployment)됩니다.
 
 ```bash
-git clone [https://github.com/your-username/CPNR_dt5730s.git](https://github.com/your-username/CPNR_dt5730s.git)
+git clone https://github.com/opercjy/CPNR_dt5730s
 cd CPNR_dt5730s
 mkdir build && cd build
 cmake ..
