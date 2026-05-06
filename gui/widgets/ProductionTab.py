@@ -3,19 +3,24 @@ import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
                              QTextEdit, QSpinBox, QFileDialog, QGridLayout)
-from PyQt5.QtCore import Qt, pyqtSlot, QSettings
+from PyQt5.QtCore import Qt, pyqtSlot, QSettings, QProcess
 
 class ProductionTab(QWidget):
-    def __init__(self, process_manager):
+    def __init__(self):
         super().__init__()
-        self.pm = process_manager
         
-        # 시스템 설정(QSettings) 초기화: 경로 기억용
+        # OS 레지스트리/설정 기반 마지막 폴더 기억
         self.settings = QSettings("CPNR", "DT5730S_DAQ")
         
+        # 🌟 외부 ProcessManager에 의존하지 않는 독자적 QProcess 엔진 탑재
+        self.process = QProcess()
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.finished.connect(self.handle_finished)
+
         self.init_ui()
 
-        # 정규표현식 컴파일 (C++ 백엔드에서 쏘는 포맷)
+        # 백엔드 로그 파싱 정규식
         self.log_pattern = re.compile(
             r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)"
         )
@@ -23,9 +28,7 @@ class ProductionTab(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
 
-        # =====================================================================
         # 1. Input / Output Selection
-        # =====================================================================
         io_group = QGroupBox("Input / Output Selection")
         io_layout = QGridLayout()
         
@@ -47,22 +50,18 @@ class ProductionTab(QWidget):
         io_group.setLayout(io_layout)
         layout.addWidget(io_group)
 
-        # =====================================================================
         # 2. Conversion Options & Interactive Debugger Controls
-        # =====================================================================
         opt_group = QGroupBox("Conversion Options & Interactive Debugger")
         opt_layout = QHBoxLayout()
         
-        # 실행 제어 버튼
         self.btn_run = QPushButton("▶ Run ROOT Conversion")
         self.btn_run.setStyleSheet("background-color: #5bc0de; color: white; font-weight: bold; padding: 8px;")
         self.btn_run.clicked.connect(self.run_conversion)
         
         self.btn_stop = QPushButton("■ Force Stop")
         self.btn_stop.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 8px;")
-        self.btn_stop.clicked.connect(self.pm.stop_process)
+        self.btn_stop.clicked.connect(self.stop_all)
 
-        # 인터랙티브 컨트롤 패널
         self.btn_prev = QPushButton("◁ Prev (p)")
         self.btn_next = QPushButton("▷ Next (n)")
         self.btn_jump = QPushButton("↷ Jump (j)")
@@ -70,7 +69,6 @@ class ProductionTab(QWidget):
         self.spin_jump.setRange(0, 9999999)
         self.btn_quit = QPushButton("✕ Quit Debug (q)")
 
-        # 시그널 매핑 (표준 입력으로 전송)
         self.btn_prev.clicked.connect(lambda: self.send_debug_command("p\n"))
         self.btn_next.clicked.connect(lambda: self.send_debug_command("n\n"))
         self.btn_jump.clicked.connect(lambda: self.send_debug_command(f"j {self.spin_jump.value()}\n"))
@@ -87,9 +85,7 @@ class ProductionTab(QWidget):
         opt_group.setLayout(opt_layout)
         layout.addWidget(opt_group)
 
-        # =====================================================================
-        # 3. 📊 Dashboard (진행률 및 실시간 스탯)
-        # =====================================================================
+        # 3. Dashboard
         dash_group = QGroupBox("Conversion Status Dashboard")
         dash_layout = QVBoxLayout()
         
@@ -117,9 +113,7 @@ class ProductionTab(QWidget):
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
 
-        # =====================================================================
         # 4. Raw Log Window
-        # =====================================================================
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
         self.log_console.setMaximumHeight(150)
@@ -128,32 +122,25 @@ class ProductionTab(QWidget):
 
         self.setLayout(layout)
 
-        # ProcessManager 시그널 연결
-        self.pm.log_signal.connect(self.parse_and_update_dashboard)
-
     # =====================================================================
-    # 파일 탐색 및 경로 기억 (QSettings 활용)
+    # 경로 기억 로직
     # =====================================================================
     def browse_input(self):
-        # 1. 저장된 마지막 경로 불러오기 (없으면 현재 디렉토리)
         last_dir = self.settings.value("last_prod_input_dir", os.getcwd())
-        
         fname, _ = QFileDialog.getOpenFileName(self, "Open Raw Data", last_dir, "Data Files (*.dat)")
         if fname:
             self.input_edit.setText(fname)
-            # 2. 선택한 파일의 폴더 경로를 저장하여 다음 번에 재사용
             self.settings.setValue("last_prod_input_dir", os.path.dirname(fname))
 
     def browse_output(self):
         last_dir = self.settings.value("last_prod_output_dir", os.getcwd())
-        
         fname, _ = QFileDialog.getSaveFileName(self, "Save ROOT Data", last_dir, "ROOT Files (*.root)")
         if fname:
             self.output_edit.setText(fname)
             self.settings.setValue("last_prod_output_dir", os.path.dirname(fname))
 
     # =====================================================================
-    # 실행 및 통신 로직
+    # QProcess 제어 로직 (시작, 정지, 명령어 전송)
     # =====================================================================
     def run_conversion(self):
         in_file = self.input_edit.text().strip()
@@ -163,46 +150,62 @@ class ProductionTab(QWidget):
             self.log_console.append("<span style='color:red;'>[Error] Please select input file!</span>")
             return
             
-        cmd = ["./bin/production_dt5730", "-i", in_file]
+        args = ["-i", in_file]
         if out_file:
-            cmd.extend(["-o", out_file])
+            args.extend(["-o", out_file])
             
-        # UI 초기화
         self.progress_bar.setValue(0)
         self.lbl_events.setText("Events: 0")
         self.lbl_speed.setText("Speed: 0.0 MB/s")
         self.lbl_eta.setText("ETA: 0 s")
         self.log_console.clear()
         
-        self.pm.start_process(cmd)
+        self.btn_run.setEnabled(False)
+        self.process.start("./bin/production_dt5730", args)
+
+    def stop_all(self):
+        if self.process.state() == QProcess.Running:
+            self.process.terminate()
+            self.process.waitForFinished(1000)
+            if self.process.state() == QProcess.Running:
+                self.process.kill()
+            self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
 
     def send_debug_command(self, cmd_str):
-        """인터랙티브 디버깅 시 C++ 백엔드의 표준 입력(stdin)으로 비동기 명령 전송"""
-        if self.pm.process and self.pm.process.state() == self.pm.process.Running:
-            self.pm.process.write(cmd_str.encode('utf-8'))
+        if self.process.state() == QProcess.Running:
+            self.process.write(cmd_str.encode('utf-8'))
             self.log_console.append(f"<span style='color:yellow;'>[Sent Command] {cmd_str.strip()}</span>")
 
-    @pyqtSlot(str)
-    def parse_and_update_dashboard(self, text):
-        """C++ stdout 파싱 및 대시보드 라우팅"""
-        text = text.strip()
-        if not text:
-            return
+    # =====================================================================
+    # 스트리밍 로그 파싱 및 라우팅
+    # =====================================================================
+    @pyqtSlot()
+    def handle_stdout(self):
+        while self.process.canReadLine():
+            line = self.process.readLine().data().decode('utf-8').strip()
+            if not line: continue
 
-        # 1. 정규표현식 매칭: 진행률 및 스탯 업데이트 (로그 창에는 숨김)
-        match = self.log_pattern.search(text)
-        if match:
-            progress = float(match.group(1))
-            events = match.group(2)
-            speed = match.group(3)
-            eta = match.group(4)
-            
-            self.progress_bar.setValue(int(progress))
-            self.lbl_events.setText(f"Events: {int(events):,}")
-            self.lbl_speed.setText(f"Speed: {speed} MB/s")
-            self.lbl_eta.setText(f"ETA: {eta} s")
-            return
-        
-        # 2. 일반 텍스트는 로그 창에 출력 (자동 스크롤)
-        self.log_console.append(text)
-        self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+            match = self.log_pattern.search(line)
+            if match:
+                self.progress_bar.setValue(int(float(match.group(1))))
+                self.lbl_events.setText(f"Events: {int(match.group(2)):,}")
+                self.lbl_speed.setText(f"Speed: {match.group(3)} MB/s")
+                self.lbl_eta.setText(f"ETA: {match.group(4)} s")
+            else:
+                self.log_console.append(line)
+                self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+
+    @pyqtSlot()
+    def handle_stderr(self):
+        while self.process.canReadLine():
+            line = self.process.readLine().data().decode('utf-8').strip()
+            if line:
+                self.log_console.append(f"<span style='color:red;'>{line}</span>")
+
+    @pyqtSlot(int, QProcess.ExitStatus)
+    def handle_finished(self, exitCode, exitStatus):
+        self.btn_run.setEnabled(True)
+        if exitStatus == QProcess.NormalExit:
+            self.log_console.append(f"<span style='color:#5cb85c;'>[System] Conversion Finished (Code: {exitCode})</span>")
+        else:
+            self.log_console.append("<span style='color:red;'>[System] Conversion Crashed.</span>")
