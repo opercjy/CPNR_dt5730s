@@ -30,8 +30,6 @@ void sig_handler(int) {
     g_running = 0;
 }
 
-const int MAX_CH = 8; // DT5730S 기준 최대 8채널
-
 int main(int argc, char **argv) {
     std::string input_file = "";
     std::string output_file = "";
