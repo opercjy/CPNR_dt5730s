@@ -7,6 +7,7 @@
 #include <TMacro.h>
 #include <TParameter.h>
 #include <TDatime.h>
+#include <TSystem.h> // 비동기 디버거용 gSystem
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
@@ -15,13 +16,15 @@
 #include <chrono>
 #include <csignal>
 #include <numeric>
+#include <sys/select.h> // 파이썬 GUI 통신용 논블로킹 I/O
+#include <unistd.h>
 
 #ifdef __ROOTCLING__
 #pragma link C++ class std::vector<uint16_t>+;
 #endif
 
 // ==============================================================================
-// [시스템] Graceful Shutdown을 위한 시그널 핸들러 (원본 보존)
+// [시스템] Graceful Shutdown을 위한 시그널 핸들러
 // ==============================================================================
 volatile std::sig_atomic_t g_running = 1;
 
@@ -29,6 +32,8 @@ void sig_handler(int) {
     std::cout << "\n\033[1;33m[Interrupt] Received stop signal. Saving ROOT file gracefully...\033[0m\n";
     g_running = 0;
 }
+
+// 주의: MAX_CH는 EventHeader.h에 정의(constexpr int MAX_CH = 8;)되어 있으므로 여기서 재정의하지 않습니다.
 
 int main(int argc, char **argv) {
     std::string input_file = "";
@@ -39,7 +44,6 @@ int main(int argc, char **argv) {
     bool save_waveform = false; 
 
     int opt;
-    // (원본 보존) 다양한 커맨드라인 옵션 지원
     while ((opt = getopt(argc, argv, "i:o:c:r:d:w")) != -1) {
         switch (opt) {
             case 'i': input_file = optarg; break;
@@ -57,7 +61,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // (원본 보존) 출력 파일명 자동 생성
+    // 출력 파일명 자동 생성
     if (output_file.empty() && debug_event_id < 0) {
         size_t last_dot = input_file.find_last_of(".");
         size_t last_slash = input_file.find_last_of("/\\");
@@ -71,7 +75,7 @@ int main(int argc, char **argv) {
     std::signal(SIGINT, sig_handler);
     std::signal(SIGTERM, sig_handler);
 
-    // (원본 보존) 고속 I/O를 위한 4MB 버퍼링
+    // 고속 I/O를 위한 4MB 버퍼링
     std::ifstream ifs;
     std::vector<char> read_buffer(4 * 1024 * 1024);
     ifs.rdbuf()->pubsetbuf(read_buffer.data(), read_buffer.size());
@@ -82,7 +86,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // (원본 보존) 진행률(ETA) 계산을 위한 전체 파일 사이즈 획득
     ifs.seekg(0, std::ios::end);
     size_t total_bytes = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
@@ -99,17 +102,15 @@ int main(int argc, char **argv) {
     TTree *tOut = nullptr;
     EventHeader header;
     
-    // 트리 브랜치 변수
-    uint32_t record_len_branch = 0; // [NEW] 레코드 길이 메타데이터 저장용
+    uint32_t record_len_branch = 0; 
     std::vector<uint16_t> wave_ch[MAX_CH];
     double charge_ch[MAX_CH] = {0.0};
     double pulse_start_time_ch[MAX_CH] = {0.0}; 
-    double baseline_ch[MAX_CH] = {0.0}; // [NEW] 베이스라인 값 저장용
+    double baseline_ch[MAX_CH] = {0.0}; 
 
     if (debug_event_id < 0) {
         fOut = new TFile(output_file.c_str(), "RECREATE");
         
-        // (원본 보존) .conf 설정 파일을 ROOT 파일 내부에 메타데이터로 통째로 저장
         if (!config_file.empty()) {
             std::ifstream cfs(config_file);
             if (cfs.is_open()) {
@@ -125,12 +126,12 @@ int main(int argc, char **argv) {
         tOut->Branch("EventID", &header.EventID, "EventID/i");
         tOut->Branch("SyncTime_TTT", &header.ExtendedTTT, "SyncTime_TTT/l");
         tOut->Branch("ChannelMask", &header.ChannelMask, "ChannelMask/s");
-        tOut->Branch("RecordLength", &record_len_branch, "RecordLength/i"); // [NEW]
+        tOut->Branch("RecordLength", &record_len_branch, "RecordLength/i"); 
 
         for (int i = 0; i < MAX_CH; ++i) {
             tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
             tOut->Branch(Form("PulseStart_T0_CH%d", i), &pulse_start_time_ch[i], Form("PulseStart_T0_CH%d/D", i));
-            tOut->Branch(Form("Baseline_CH%d", i), &baseline_ch[i], Form("Baseline_CH%d/D", i)); // [NEW]
+            tOut->Branch(Form("Baseline_CH%d", i), &baseline_ch[i], Form("Baseline_CH%d/D", i)); 
             
             if (save_waveform) {
                 tOut->Branch(Form("Waveform_CH%d", i), &wave_ch[i]);
@@ -147,7 +148,7 @@ int main(int argc, char **argv) {
     while (g_running && ifs.read(reinterpret_cast<char *>(&header), sizeof(EventHeader))) {
         processed_bytes += sizeof(EventHeader);
         current_event++;
-        record_len_branch = header.RecordLength; // 헤더에서 동적 길이 추출
+        record_len_branch = header.RecordLength; 
 
         int active_ch = 0;
         for (int i = 0; i < MAX_CH; ++i) {
@@ -161,7 +162,6 @@ int main(int argc, char **argv) {
         size_t wave_len = header.RecordLength * active_ch;
         size_t wave_bytes_size = wave_len * sizeof(uint16_t);
 
-        // (원본 보존) 고속 메모리 포인터 접근을 위한 단일 버퍼 리드
         raw_waveform_buffer.resize(wave_len);
         ifs.read(reinterpret_cast<char *>(raw_waveform_buffer.data()), wave_bytes_size);
         processed_bytes += wave_bytes_size;
@@ -172,7 +172,7 @@ int main(int argc, char **argv) {
                 uint16_t* trace_ptr = raw_waveform_buffer.data() + offset;
                 size_t trace_len = header.RecordLength;
 
-                // 🌟 [제1원리 통합] 메타데이터 기반 동적 베이스라인 (25%, 최대 150 샘플 방어)
+                // 🌟 메타데이터 기반 동적 베이스라인 (25%, 최대 150 샘플 방어)
                 if (trace_len > 0) {
                     size_t baseline_samples = std::min((size_t)150, (size_t)(trace_len * 0.25));
                     
@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
 
         if (tOut) tOut->Fill();
 
-        // (원본 보존) 정밀 ETA 및 네트워크 속도 스타일의 진행률 표시
+        // 정밀 ETA 및 스피드 진행률 표시
         if (current_event % 2000 == 0) {
             auto now = std::chrono::steady_clock::now();
             double elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
                       << "ETA: " << (int)eta_sec << " s" << std::flush;
         }
 
-        // 🌟 (원본 + 개선) 인터랙티브 디버거 모드 (베이스라인 시각화 추가)
+        // 🌟 인터랙티브 디버거 모드 (비동기 I/O 통신 적용)
         if (debug_event_id >= 0 && (int)header.EventID == debug_event_id && active_ch > 0) {
             int disp_ch = 0;
             for (; disp_ch < MAX_CH; ++disp_ch) {
@@ -234,7 +234,7 @@ int main(int argc, char **argv) {
             }
             std::vector<double> x(header.RecordLength), y(header.RecordLength);
             for (size_t i = 0; i < header.RecordLength; ++i) {
-                x[i] = i * 2.0; // 시간(ns) 변환
+                x[i] = i * 2.0; 
                 y[i] = wave_ch[disp_ch][i];
             }
             TGraph *gr = new TGraph(header.RecordLength, x.data(), y.data());
@@ -244,7 +244,6 @@ int main(int argc, char **argv) {
             gr->SetLineWidth(2);
             gr->Draw("AL");
 
-            // 베이스라인 시각적 확인 (빨간 점선)
             TGraph* bl_line = new TGraph(2);
             bl_line->SetPoint(0, 0, baseline_ch[disp_ch]);
             bl_line->SetPoint(1, header.RecordLength * 2.0, baseline_ch[disp_ch]);
@@ -254,11 +253,59 @@ int main(int argc, char **argv) {
             bl_line->Draw("L SAME");
 
             c1->Update();
-            std::cout << "\n\n\033[1;33m[Debugger] Displaying Event " << debug_event_id << " CH" << disp_ch << "\033[0m";
-            std::cout << "\nRecordLength: " << header.RecordLength << " | Baseline: " << baseline_ch[disp_ch] << "\n";
-            std::cout << "\033[1;32m(Close the TCanvas window or press Ctrl+C in terminal to exit)\033[0m\n";
-            app->Run(true);
-            break; 
+            
+            std::cout << "\n\n\033[1;33m[Debugger] Displaying Event " << debug_event_id << " CH" << disp_ch << "\033[0m\n";
+            std::cout << "RecordLength: " << header.RecordLength << " | Baseline: " << baseline_ch[disp_ch] << "\n";
+            std::cout << "[WAITING_CMD] Ready for Python GUI Input (p/n/j/q)...\n";
+            std::cout << std::flush; 
+
+            std::string cmd;
+            bool continue_debug = true;
+            
+            // 파이썬 GUI와 통신하기 위한 비동기 입력 루프
+            while (continue_debug && g_running) {
+                gSystem->ProcessEvents(); // GUI 창이 얼지 않도록 이벤트 처리
+
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(STDIN_FILENO, &readfds);
+                struct timeval timeout;
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 100000; // 0.1초마다 폴링
+
+                if (select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout) > 0) {
+                    std::cin >> cmd;
+                    if (cmd == "q" || cmd == "quit") {
+                        std::cout << "\n[Debugger] Exiting debugger. Resuming full conversion...\n";
+                        debug_event_id = -1; 
+                        continue_debug = false;
+                        if(c1) { c1->Close(); delete c1; c1 = nullptr; }
+                    } 
+                    else if (cmd == "n" || cmd == "next") {
+                        debug_event_id++; 
+                        std::cout << "\n[Debugger] Moving to next event (" << debug_event_id << ")...\n";
+                        continue_debug = false;
+                    } 
+                    else if (cmd == "p" || cmd == "prev") {
+                        std::cout << "\n[Debugger] 'prev' stream is forward only. Moving to next instead.\n";
+                        debug_event_id++; 
+                        continue_debug = false;
+                    } 
+                    else if (cmd == "j" || cmd == "jump") {
+                        int target;
+                        std::cin >> target;
+                        if (target > (int)current_event) {
+                            debug_event_id = target;
+                            std::cout << "\n[Debugger] Jumping to event " << debug_event_id << "...\n";
+                            continue_debug = false;
+                        } else {
+                            std::cout << "\n[Debugger] Target event (" << target << ") is already passed. Ignoring.\n";
+                        }
+                    }
+                    std::cout << std::flush;
+                }
+            }
+            if (debug_event_id >= 0) continue; // 다음 디버그 이벤트를 찾기 위해 진행
         }
     }
 
