@@ -44,8 +44,9 @@
   * `CAENUSB` (USB 커널 드라이버)
   * `CAENVME` (CAENVMELib)
   * `CAENComm`
-  * `CAENDigitizer` (v1.0 이상 버전)
+  * `CAENDigitizer` (v1.0 버전)
   > ⚠️ **[주의] 커널(Kernel) 업데이트 관련:** Linux OS의 커널 버전이 업데이트될 경우, 기존에 빌드된 `CAENUSB` 커널 모듈(드라이버)의 종속성이 끊어져 장치를 인식하지 못합니다. **OS 커널 업데이트 직후에는 반드시 `CAENUSB` 소스 디렉토리로 이동하여 설치 스크립트(예: `sudo sh install` 을 이용한 DKMS 빌드)를 재실행**해야 합니다.
+  > 신형 장비 경우 libusb-1.0 라이브러리를 이용함에 따라 커널 모듈 종속성에 대하여 유연하게 대처할 수 있습니다. 
 * **Data Libraries:** 
   * ROOT 6 (built with C++17 지원 플래그)
   * ZeroMQ (`libzmq3-dev`)
