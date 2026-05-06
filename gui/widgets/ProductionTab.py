@@ -1,132 +1,181 @@
-import os
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
-                             QPushButton, QLineEdit, QLabel, QTextEdit, 
-                             QGroupBox, QSpinBox, QCheckBox, QFileDialog)
-from PyQt5.QtGui import QFont, QTextCursor
-from core.ProcessManager import ProcessManager
+import re
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
+                             QPushButton, QProgressBar, QLabel, QLineEdit, 
+                             QTextEdit, QSpinBox, QFileDialog, QFormLayout, QGridLayout)
+from PyQt5.QtCore import Qt, pyqtSlot
 
 class ProductionTab(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.prod_process = None
-        self.bin_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        self.setup_ui()
+    def __init__(self, process_manager):
+        super().__init__()
+        self.pm = process_manager
+        self.init_ui()
 
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
+        # 정규표현식 컴파일: [Progress] 2.5% | Events: 56000 | Speed: 41.4 MB/s | ETA: 106 s
+        self.log_pattern = re.compile(
+            r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)"
+        )
 
-        file_group = QGroupBox("Input / Output Selection")
-        file_layout = QGridLayout()
-        file_layout.addWidget(QLabel("Input Raw (.dat):"), 0, 0)
-        self.input_file = QLineEdit("../data/data_run.dat")
-        file_layout.addWidget(self.input_file, 0, 1)
-        self.btn_browse_in = QPushButton("📂 Browse")
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # 1. Input / Output Selection
+        io_group = QGroupBox("Input / Output Selection")
+        io_layout = QGridLayout()
+        
+        self.input_edit = QLineEdit()
+        self.btn_browse_in = QPushButton("📁 Browse")
         self.btn_browse_in.clicked.connect(self.browse_input)
-        file_layout.addWidget(self.btn_browse_in, 0, 2)
-
-        file_layout.addWidget(QLabel("Output ROOT (.root):"), 1, 0)
-        self.output_file = QLineEdit("")
-        self.output_file.setPlaceholderText("Auto-generated if empty")
-        file_layout.addWidget(self.output_file, 1, 1)
-        self.btn_browse_out = QPushButton("📂 Browse")
+        
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("Auto-generated if empty (*_prod.root)")
+        self.btn_browse_out = QPushButton("📁 Browse")
         self.btn_browse_out.clicked.connect(self.browse_output)
-        file_layout.addWidget(self.btn_browse_out, 1, 2)
-        file_group.setLayout(file_layout)
-        layout.addWidget(file_group)
 
-        opt_group = QGroupBox("Conversion Options")
+        io_layout.addWidget(QLabel("Input Raw (.dat):"), 0, 0)
+        io_layout.addWidget(self.input_edit, 0, 1)
+        io_layout.addWidget(self.btn_browse_in, 0, 2)
+        io_layout.addWidget(QLabel("Output ROOT (.root):"), 1, 0)
+        io_layout.addWidget(self.output_edit, 1, 1)
+        io_layout.addWidget(self.btn_browse_out, 1, 2)
+        io_group.setLayout(io_layout)
+        layout.addWidget(io_group)
+
+        # 2. Conversion Options & Interactive Debugger Controls
+        opt_group = QGroupBox("Conversion Options & Interactive Debugger")
         opt_layout = QHBoxLayout()
-        self.chk_waveform = QCheckBox("Save Waveforms (-w)")
-        self.chk_waveform.setChecked(True) 
-        opt_layout.addWidget(self.chk_waveform)
+        
+        # 시작 버튼
+        self.btn_run = QPushButton("▶ Run ROOT Conversion")
+        self.btn_run.setStyleSheet("background-color: #5bc0de; color: white; font-weight: bold; padding: 8px;")
+        self.btn_run.clicked.connect(self.run_conversion)
+        
+        self.btn_stop = QPushButton("■ Force Stop")
+        self.btn_stop.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 8px;")
+        self.btn_stop.clicked.connect(self.pm.stop_process)
 
-        opt_layout.addWidget(QLabel(" |   Interactive Debug Event ID (-d):"))
-        self.spin_debug = QSpinBox()
-        self.spin_debug.setRange(-1, 2000000000)
-        self.spin_debug.setValue(-1)
-        opt_layout.addWidget(self.spin_debug)
-        opt_layout.addStretch()
+        # 인터랙티브 컨트롤 패널 (평소엔 비활성화)
+        self.btn_prev = QPushButton("◁ Prev (p)")
+        self.btn_next = QPushButton("▷ Next (n)")
+        self.btn_jump = QPushButton("↷ Jump (j)")
+        self.spin_jump = QSpinBox()
+        self.spin_jump.setRange(0, 9999999)
+        self.btn_quit = QPushButton("✕ Quit Debug (q)")
+
+        # 디버그 버튼들에 단축키(Shortcut) 매핑 및 시그널 전송 연결
+        self.btn_prev.clicked.connect(lambda: self.send_debug_command("p\n"))
+        self.btn_next.clicked.connect(lambda: self.send_debug_command("n\n"))
+        self.btn_jump.clicked.connect(lambda: self.send_debug_command(f"j {self.spin_jump.value()}\n"))
+        self.btn_quit.clicked.connect(lambda: self.send_debug_command("q\n"))
+
+        opt_layout.addWidget(self.btn_run)
+        opt_layout.addWidget(self.btn_stop)
+        opt_layout.addSpacing(20)
+        opt_layout.addWidget(self.btn_prev)
+        opt_layout.addWidget(self.btn_next)
+        opt_layout.addWidget(self.spin_jump)
+        opt_layout.addWidget(self.btn_jump)
+        opt_layout.addWidget(self.btn_quit)
         opt_group.setLayout(opt_layout)
         layout.addWidget(opt_group)
 
-        btn_layout = QHBoxLayout()
-        self.btn_run = QPushButton("⚙️ Run ROOT Conversion")
-        self.btn_run.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
-        self.btn_run.clicked.connect(self.run_production)
+        # 3. 📊 Dashboard (진행률 및 실시간 스탯)
+        dash_group = QGroupBox("Conversion Status Dashboard")
+        dash_layout = QVBoxLayout()
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #5cb85c; }")
 
-        self.btn_stop = QPushButton("■ Force Stop")
-        self.btn_stop.setStyleSheet("background-color: #6c757d; color: white; font-weight: bold; padding: 10px;")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_all)
+        stat_layout = QHBoxLayout()
+        self.lbl_events = QLabel("Events: 0")
+        self.lbl_speed = QLabel("Speed: 0.0 MB/s")
+        self.lbl_eta = QLabel("ETA: 0 s")
+        
+        # 폰트 크게 설정
+        font = self.lbl_events.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        for lbl in [self.lbl_events, self.lbl_speed, self.lbl_eta]:
+            lbl.setFont(font)
+            lbl.setAlignment(Qt.AlignCenter)
+            stat_layout.addWidget(lbl)
 
-        btn_layout.addWidget(self.btn_run)
-        btn_layout.addWidget(self.btn_stop)
-        layout.addLayout(btn_layout)
+        dash_layout.addWidget(self.progress_bar)
+        dash_layout.addLayout(stat_layout)
+        dash_group.setLayout(dash_layout)
+        layout.addWidget(dash_group)
 
-        self.terminal = QTextEdit()
-        self.terminal.setReadOnly(True)
-        self.terminal.setFont(QFont("Monospace", 10))
-        self.terminal.setStyleSheet("background-color: #f8f9fa; color: #212529; border: 1px solid #ced4da;")
-        layout.addWidget(self.terminal)
+        # 4. Raw Log Window (에러나 시스템 메시지만 작게 출력)
+        self.log_console = QTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumHeight(100) # 높이를 대폭 줄임
+        self.log_console.setStyleSheet("background-color: #2b2b2b; color: #a9b7c6; font-family: monospace;")
+        layout.addWidget(self.log_console)
+
+        self.setLayout(layout)
+
+        # ProcessManager로부터의 로그 시그널 연결
+        self.pm.log_signal.connect(self.parse_and_update_dashboard)
 
     def browse_input(self):
-        default_dir = os.path.abspath(os.path.join(self.bin_dir, "../data"))
-        path, _ = QFileDialog.getOpenFileName(self, "Select Raw Data", default_dir, "Data Files (*.dat)")
-        if path: self.input_file.setText(os.path.relpath(path, self.bin_dir))
+        fname, _ = QFileDialog.getOpenFileName(self, "Open Raw Data", "", "Data Files (*.dat)")
+        if fname:
+            self.input_edit.setText(fname)
 
     def browse_output(self):
-        default_dir = os.path.abspath(os.path.join(self.bin_dir, "../data"))
-        path, _ = QFileDialog.getSaveFileName(self, "Select Output ROOT", default_dir, "ROOT Files (*.root)")
-        if path: self.output_file.setText(os.path.relpath(path, self.bin_dir))
+        fname, _ = QFileDialog.getSaveFileName(self, "Save ROOT Data", "", "ROOT Files (*.root)")
+        if fname:
+            self.output_edit.setText(fname)
 
-    def append_log(self, text):
-        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        color = "#212529" 
-        bold = False
-        
-        if "[Info]" in safe_text or "[Debugger]" in safe_text:
-            color = "#0d6efd" 
-            bold = True
-        elif "[Production]" in safe_text:
-            color = "#198754" 
-            bold = True
-        elif "[Warning]" in safe_text or "Error" in safe_text:
-            color = "#dc3545" 
-            bold = True
-        elif "[Progress]" in safe_text:
-            color = "#fd7e14" 
-        elif safe_text.strip().startswith("[") and "]" in safe_text:
-            color = "#6f42c1" 
+    def run_conversion(self):
+        in_file = self.input_edit.text().strip()
+        out_file = self.output_edit.text().strip()
+        if not in_file:
+            self.log_console.append("<span style='color:red;'>[Error] Please select input file!</span>")
+            return
             
-        b_open = "<b>" if bold else ""
-        b_close = "</b>" if bold else ""
-        html_line = f'<span style="color: {color};">{b_open}{safe_text}{b_close}</span>'
-        self.terminal.append(html_line)
-        self.terminal.moveCursor(QTextCursor.End)
-
-    def run_production(self):
-        cmd = ["./production_dt5730", "-i", self.input_file.text()]
-        if self.output_file.text().strip(): cmd.extend(["-o", self.output_file.text()])
-        if self.chk_waveform.isChecked(): cmd.append("-w")
-        if self.spin_debug.value() >= 0: cmd.extend(["-d", str(self.spin_debug.value())])
-
-        self.prod_process = ProcessManager(cmd, cwd=self.bin_dir)
-        self.prod_process.log_signal.connect(self.append_log)
-        self.prod_process.finished_signal.connect(self.on_finished)
-        
-        self.append_log(f"\n>>> Executing ROOT Converter: {' '.join(cmd)}")
-        if self.spin_debug.value() >= 0:
-            self.append_log("[Info] Interactive Debug Mode ON. A ROOT Canvas window should pop up.")
+        cmd = ["./bin/production_dt5730", "-i", in_file]
+        if out_file:
+            cmd.extend(["-o", out_file])
             
-        self.prod_process.start()
-        self.btn_run.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        # 초기화
+        self.progress_bar.setValue(0)
+        self.log_console.clear()
+        
+        # 백엔드 실행
+        self.pm.start_process(cmd)
 
-    def on_finished(self, returncode):
-        self.append_log(f">>> Conversion Exited (Code: {returncode})")
-        self.btn_run.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+    def send_debug_command(self, cmd_str):
+        """인터랙티브 디버깅 시 C++ 백엔드의 표준 입력(stdin)으로 명령 전송"""
+        if self.pm.process and self.pm.process.state() == self.pm.process.Running:
+            self.pm.process.write(cmd_str.encode('utf-8'))
+            self.log_console.append(f"<span style='color:yellow;'>[Sent Command] {cmd_str.strip()}</span>")
 
-    def stop_all(self):
-        if self.prod_process and self.prod_process.isRunning():
-            self.prod_process.stop()
+    @pyqtSlot(str)
+    def parse_and_update_dashboard(self, text):
+        """C++에서 넘어오는 stdout을 파싱하여 UI에 분배"""
+        text = text.strip()
+        if not text:
+            return
+
+        # 1. 정규표현식으로 진행률 데이터 캐치
+        match = self.log_pattern.search(text)
+        if match:
+            # 대시보드 UI 업데이트
+            progress = float(match.group(1))
+            events = match.group(2)
+            speed = match.group(3)
+            eta = match.group(4)
+            
+            self.progress_bar.setValue(int(progress))
+            self.lbl_events.setText(f"Events: {int(events):,}") # 천 단위 콤마
+            self.lbl_speed.setText(f"Speed: {speed} MB/s")
+            self.lbl_eta.setText(f"ETA: {eta} s")
+            # 로그 창에는 출력하지 않고 버림 (도배 방지)
+            return
+        
+        # 2. 진행률이 아닌 일반 텍스트(초기화 메시지, 디버그 메시지, 에러 등)는 로그 창에 출력
+        self.log_console.append(text)
+        self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
