@@ -59,25 +59,25 @@ CPNR_dt5730s/
 ## 📸 User Interface & Experience
 
 ### 1. DAQ Control & Real-time Dashboard
-<!-- ![DAQ Control](docs/images/daq_tab.png) -->
+![DAQ Control](docs/images/daq_tab.png)
 > 모던 라이트 테마(Light Theme)가 적용된 2단 대시보드. 실시간 데이터 전송 속도(MB/s), 트리거 Rate, DB 기록 상태, 디스크 잔여 용량을 한눈에 모니터링하며, 연속 구동 및 자동 임계값 스캔을 제어합니다.
 
 ### 2. Hardware Config & Master Architect Calculator
-<!-- ![Hardware Config](docs/images/config_tab.png) -->
+![Hardware Config](docs/images/config_tab.png)
 > 장비 조준경(DCOffset, Threshold 등)을 표에서 즉시 편집합니다. 16-bit 역방향 DAC 오프셋, 14-bit ADC 트리거 깊이, 그리고 가변 레코드 길이에 따른 최적의 페데스탈(Baseline) 샘플 수를 마우스만으로 역산출하여 `.conf`에 주입하는 궁극의 시뮬레이터가 탑재되어 있습니다.
 
 ### 3. Live Monitor (Auto Multi-Channel Overlay)
-<!-- ![Live Monitor](docs/images/monitor_tab.png) -->
+![Live Monitor](docs/images/monitor_tab.png)
 > 사용자가 타겟 채널을 고를 필요 없이, 켜져 있는 모든 채널을 자동 감지하여 파형(Waveform)과 에너지 스펙트럼(Q-Long)을 각기 다른 색상으로 한 캔버스에 투명하게 오버레이(Overlay) 합니다. 최대 누적 이벤트 수를 동적으로 조절하여 시인성을 확보합니다.
 
 ### 4. Offline Production (Micro-Time Extraction)
-<!-- ![Offline Production](docs/images/production_tab.png) -->
+![Offline Production](docs/images/production_tab.png)
 > 이진 데이터(`.dat`)의 ROOT 변환을 전담합니다. 변환 예상 시간(ETA) 출력 기능과 함께, 파형 내부의 정밀 펄스 시작 시간(T0) 추출 기능, 파형 강제 저장(-w) 옵션, 그리고 특정 이벤트를 팝업으로 띄우는 하드코어 디버깅(-d) 모드를 지원합니다.
 
 ### 5. Run DB History
-<!-- ![Run DB History](docs/images/db_tab.png) -->
+![Run DB History](docs/images/db_tab.png)
 > SQLite 데이터베이스에 기록된 과거 측정 이력 리스트업. 당시 장비에 인가된 다중 채널 고전압(HV) 값과 `.conf` 설정 파일의 전체 스냅샷을 영구 보존하고 추적합니다.
-
+> 
 ---
 
 ## 🏛️ System Architecture 
