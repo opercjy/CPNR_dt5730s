@@ -2,7 +2,7 @@ import re
 import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
-                             QTextEdit, QSpinBox, QFileDialog, QGridLayout)
+                             QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
 from PyQt5.QtCore import Qt, pyqtSlot, QSettings, QProcess
 
 class ProductionTab(QWidget):
@@ -12,11 +12,12 @@ class ProductionTab(QWidget):
         # OS 레지스트리/설정 기반 마지막 폴더 기억
         self.settings = QSettings("CPNR", "DT5730S_DAQ")
         
-        # 🌟 외부 ProcessManager에 의존하지 않는 독자적 QProcess 엔진 탑재
+        # 외부 ProcessManager에 의존하지 않는 독자적 QProcess 엔진 탑재
         self.process = QProcess()
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.handle_finished)
+        self.process.errorOccurred.connect(self.handle_error)
 
         self.init_ui()
 
@@ -28,7 +29,9 @@ class ProductionTab(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
 
+        # =====================================================================
         # 1. Input / Output Selection
+        # =====================================================================
         io_group = QGroupBox("Input / Output Selection")
         io_layout = QGridLayout()
         
@@ -50,9 +53,15 @@ class ProductionTab(QWidget):
         io_group.setLayout(io_layout)
         layout.addWidget(io_group)
 
+        # =====================================================================
         # 2. Conversion Options & Interactive Debugger Controls
+        # =====================================================================
         opt_group = QGroupBox("Conversion Options & Interactive Debugger")
         opt_layout = QHBoxLayout()
+        
+        # 파형 보존 옵션 (-w)
+        self.chk_save_waveforms = QCheckBox("Save Waveforms (-w)")
+        self.chk_save_waveforms.setStyleSheet("font-weight: bold;")
         
         self.btn_run = QPushButton("▶ Run ROOT Conversion")
         self.btn_run.setStyleSheet("background-color: #5bc0de; color: white; font-weight: bold; padding: 8px;")
@@ -74,6 +83,7 @@ class ProductionTab(QWidget):
         self.btn_jump.clicked.connect(lambda: self.send_debug_command(f"j {self.spin_jump.value()}\n"))
         self.btn_quit.clicked.connect(lambda: self.send_debug_command("q\n"))
 
+        opt_layout.addWidget(self.chk_save_waveforms)
         opt_layout.addWidget(self.btn_run)
         opt_layout.addWidget(self.btn_stop)
         opt_layout.addSpacing(20)
@@ -85,7 +95,9 @@ class ProductionTab(QWidget):
         opt_group.setLayout(opt_layout)
         layout.addWidget(opt_group)
 
+        # =====================================================================
         # 3. Dashboard
+        # =====================================================================
         dash_group = QGroupBox("Conversion Status Dashboard")
         dash_layout = QVBoxLayout()
         
@@ -113,11 +125,13 @@ class ProductionTab(QWidget):
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
 
-        # 4. Raw Log Window
+        # =====================================================================
+        # 4. Raw Log Window (밝은 테마)
+        # =====================================================================
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
         self.log_console.setMaximumHeight(150)
-        self.log_console.setStyleSheet("background-color: #2b2b2b; color: #a9b7c6; font-family: monospace;")
+        self.log_console.setStyleSheet("background-color: #f8f9fa; color: #333333; font-family: monospace; border: 1px solid #cccccc;")
         layout.addWidget(self.log_console)
 
         self.setLayout(layout)
@@ -154,14 +168,30 @@ class ProductionTab(QWidget):
         if out_file:
             args.extend(["-o", out_file])
             
+        # 체크박스 상태 확인 후 -w 인자 추가
+        if self.chk_save_waveforms.isChecked():
+            args.append("-w")
+            
         self.progress_bar.setValue(0)
         self.lbl_events.setText("Events: 0")
         self.lbl_speed.setText("Speed: 0.0 MB/s")
         self.lbl_eta.setText("ETA: 0 s")
         self.log_console.clear()
         
+        # 🌟 경로 추상화 (Soft-Coding) 완벽 적용
+        widget_dir = os.path.dirname(os.path.abspath(__file__)) # .../bin/gui/widgets
+        gui_dir = os.path.dirname(widget_dir)                   # .../bin/gui
+        bin_dir = os.path.dirname(gui_dir)                      # .../bin (실행파일 위치)
+        
+        exe_path = os.path.join(bin_dir, "production_dt5730")
+        
+        if not os.path.exists(exe_path):
+            self.log_console.append(f"<span style='color:red;'>[Error] Executable not found at: {exe_path}. Did you run 'make'?</span>")
+            return
+
         self.btn_run.setEnabled(False)
-        self.process.start("./bin/production_dt5730", args)
+        self.log_console.append(f"<b>[System] Starting:</b> {exe_path} {' '.join(args)}")
+        self.process.start(exe_path, args)
 
     def stop_all(self):
         if self.process.state() == QProcess.Running:
@@ -170,11 +200,12 @@ class ProductionTab(QWidget):
             if self.process.state() == QProcess.Running:
                 self.process.kill()
             self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
+            self.btn_run.setEnabled(True)
 
     def send_debug_command(self, cmd_str):
         if self.process.state() == QProcess.Running:
             self.process.write(cmd_str.encode('utf-8'))
-            self.log_console.append(f"<span style='color:yellow;'>[Sent Command] {cmd_str.strip()}</span>")
+            self.log_console.append(f"<span style='color:blue;'>[Sent Command] {cmd_str.strip()}</span>")
 
     # =====================================================================
     # 스트리밍 로그 파싱 및 라우팅
@@ -202,10 +233,24 @@ class ProductionTab(QWidget):
             if line:
                 self.log_console.append(f"<span style='color:red;'>{line}</span>")
 
+    @pyqtSlot(QProcess.ProcessError)
+    def handle_error(self, error):
+        error_msgs = {
+            QProcess.FailedToStart: "Failed to start. Executable missing or lacks permissions.",
+            QProcess.Crashed: "Process crashed.",
+            QProcess.Timedout: "Process timed out.",
+            QProcess.WriteError: "Failed to write to process.",
+            QProcess.ReadError: "Failed to read from process.",
+            QProcess.UnknownError: "Unknown error occurred."
+        }
+        msg = error_msgs.get(error, "Unknown Error")
+        self.log_console.append(f"<span style='color:red;'><b>[QProcess Error]</b> {msg}</span>")
+        self.btn_run.setEnabled(True)
+
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
         self.btn_run.setEnabled(True)
-        if exitStatus == QProcess.NormalExit:
-            self.log_console.append(f"<span style='color:#5cb85c;'>[System] Conversion Finished (Code: {exitCode})</span>")
+        if exitStatus == QProcess.NormalExit and exitCode == 0:
+            self.log_console.append(f"<span style='color:#5cb85c;'><b>[System] Conversion Successfully Finished!</b></span>")
         else:
-            self.log_console.append("<span style='color:red;'>[System] Conversion Crashed.</span>")
+            self.log_console.append(f"<span style='color:red;'><b>[System] Conversion Exited with Code: {exitCode}</b></span>")
