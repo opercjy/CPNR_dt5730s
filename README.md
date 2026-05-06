@@ -71,7 +71,7 @@ CPNR_dt5730s/
 > 사용자가 타겟 채널을 고를 필요 없이, 켜져 있는 모든 채널을 자동 감지하여 파형(Waveform)과 에너지 스펙트럼(Q-Long)을 각기 다른 색상으로 한 캔버스에 투명하게 오버레이(Overlay) 합니다. 최대 누적 이벤트 수를 동적으로 조절하여 시인성을 확보합니다.
 
 ### 4. Offline Production (Micro-Time Extraction)
-![Offline Production](docs/images/production_tab.png)
+![Offline Production](docs/images/production_tab.png)(docs/images/Prod_root.png)
 > 이진 데이터(`.dat`)의 ROOT 변환을 전담합니다. 변환 예상 시간(ETA) 출력 기능과 함께, 파형 내부의 정밀 펄스 시작 시간(T0) 추출 기능, 파형 강제 저장(-w) 옵션, 그리고 특정 이벤트를 팝업으로 띄우는 하드코어 디버깅(-d) 모드를 지원합니다.
 
 ### 5. Run DB History
