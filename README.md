@@ -58,8 +58,6 @@ CPNR_dt5730s/
 
 ## 📸 User Interface & Experience
 
-*(Tip: 캡처 이미지를 `docs/images/` 경로에 업로드하면 아래에 표시됩니다.)*
-
 ### 1. DAQ Control & Real-time Dashboard
 <!-- ![DAQ Control](docs/images/daq_tab.png) -->
 > 모던 라이트 테마(Light Theme)가 적용된 2단 대시보드. 실시간 데이터 전송 속도(MB/s), 트리거 Rate, DB 기록 상태, 디스크 잔여 용량을 한눈에 모니터링하며, 연속 구동 및 자동 임계값 스캔을 제어합니다.
