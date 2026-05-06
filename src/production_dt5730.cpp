@@ -33,8 +33,6 @@ int main(int argc, char **argv) {
     std::string config_file = ""; 
     int debug_event_id = -1;
     int run_number = 0;
-    
-    // 파형 전체를 저장할지 여부 (기본값 false, Charge는 무조건 저장됨)
     bool save_waveform = false; 
 
     int opt;
@@ -90,10 +88,12 @@ int main(int argc, char **argv) {
     TFile *fOut = nullptr;
     TTree *tOut = nullptr;
     EventHeader header;
-    std::vector<uint16_t> wave_ch[MAX_CH];
     
-    // [핵심 추가] 이벤트를 적분한 전하량(Charge)을 저장할 변수
+    std::vector<uint16_t> wave_ch[MAX_CH];
     double charge_ch[MAX_CH] = {0.0};
+    
+    // [NEW] 펄스의 미세 도착 시간 (Micro-time)
+    double pulse_start_time_ch[MAX_CH] = {0.0}; 
 
     if (debug_event_id < 0) {
         fOut = new TFile(output_file.c_str(), "RECREATE");
@@ -111,14 +111,17 @@ int main(int argc, char **argv) {
 
         tOut = new TTree("phys_tree", "DT5730 Physics Data");
         tOut->Branch("EventID", &header.EventID, "EventID/i");
-        tOut->Branch("ExtendedTTT", &header.ExtendedTTT, "ExtendedTTT/l");
+        
+        // [1] 거시적 시간 (Macro Time): 장비 클록이 찍힌 절대 동기화 시간
+        tOut->Branch("SyncTime_TTT", &header.ExtendedTTT, "SyncTime_TTT/l");
         tOut->Branch("ChannelMask", &header.ChannelMask, "ChannelMask/s");
         
         for (int i = 0; i < MAX_CH; ++i) {
-            // 전하량(Charge) 브랜치는 무조건 생성하여 분석에 활용
             tOut->Branch(Form("Charge_CH%d", i), &charge_ch[i], Form("Charge_CH%d/D", i));
             
-            // 파형 배열은 -w 옵션이 있을 때만 생성하여 용량 최적화
+            // [2] 미시적 시간 (Micro Time): 파형 내부에서 펄스가 하강을 시작한 정밀 상대 시간 (ns)
+            tOut->Branch(Form("PulseStart_T0_CH%d", i), &pulse_start_time_ch[i], Form("PulseStart_T0_CH%d/D", i));
+            
             if (save_waveform) {
                 tOut->Branch(Form("Waveform_CH%d", i), &wave_ch[i]);
             }
@@ -139,16 +142,16 @@ int main(int argc, char **argv) {
         for (int i = 0; i < MAX_CH; ++i) {
             if ((header.ChannelMask >> i) & 1) active_ch++;
             wave_ch[i].clear();
-            charge_ch[i] = 0.0; // 매 이벤트 초기화
+            charge_ch[i] = 0.0;
+            pulse_start_time_ch[i] = 0.0;
         }
 
         size_t wave_len = header.RecordLength * active_ch;
-        size_t wave_bytes = wave_len * sizeof(uint16_t);
+        size_t wave_bytes_size = wave_len * sizeof(uint16_t);
 
-        // Charge 연산을 위해 파형 데이터 읽기
         raw_waveform_buffer.resize(wave_len);
-        ifs.read(reinterpret_cast<char *>(raw_waveform_buffer.data()), wave_bytes);
-        processed_bytes += wave_bytes;
+        ifs.read(reinterpret_cast<char *>(raw_waveform_buffer.data()), wave_bytes_size);
+        processed_bytes += wave_bytes_size;
 
         int offset = 0;
         for (int ch = 0; ch < MAX_CH; ++ch) {
@@ -156,20 +159,32 @@ int main(int argc, char **argv) {
                 uint16_t* trace_ptr = raw_waveform_buffer.data() + offset;
                 size_t trace_len = header.RecordLength;
 
-                // [핵심 로직] 파이썬 MonitorTab과 동일한 방식의 Software DSP 적분
                 if (trace_len > 200) {
+                    // 유동적 베이스라인 (앞 25% 공간 활용)
+                    size_t baseline_samples = trace_len / 4;
                     double baseline = 0.0;
-                    for(int i = 0; i < 150; ++i) baseline += trace_ptr[i];
-                    baseline /= 150.0;
+                    for(size_t i = 0; i < baseline_samples; ++i) baseline += trace_ptr[i];
+                    baseline /= baseline_samples;
 
+                    // 1. Charge 적분
                     double charge = 0.0;
-                    for(size_t i = 150; i < trace_len; ++i) {
+                    for(size_t i = baseline_samples; i < trace_len; ++i) {
                         charge += (baseline - trace_ptr[i]);
                     }
                     charge_ch[ch] = (charge > 0) ? charge : 0.0;
+
+                    // 2. [핵심] Micro-Time (T0) 탐색 알고리즘
+                    // 노이즈 플럭추에이션을 피하기 위해 베이스라인에서 30 Bin 아래로 뚫린 지점을 진짜 시작점(T0)으로 간주
+                    double trigger_threshold = baseline - 30.0; 
+                    for(size_t i = baseline_samples; i < trace_len; ++i) {
+                        if (trace_ptr[i] < trigger_threshold) {
+                            // DT5730S는 500MS/s 이므로 1 Sample = 2 ns
+                            pulse_start_time_ch[ch] = i * 2.0; 
+                            break;
+                        }
+                    }
                 }
 
-                // 파형을 ROOT 파일에 기록해야 하거나, 캔버스 디버깅 모드일 때만 벡터 복사
                 if (save_waveform || (debug_event_id >= 0 && (int)header.EventID == debug_event_id)) {
                     wave_ch[ch].assign(trace_ptr, trace_ptr + trace_len);
                 }
@@ -203,7 +218,8 @@ int main(int argc, char **argv) {
                 y[i] = wave_ch[disp_ch][i];
             }
             TGraph *gr = new TGraph(header.RecordLength, x.data(), y.data());
-            gr->SetTitle(Form("Event %d (CH%d) - Charge: %.1f;Sample Index;ADC Value", debug_event_id, disp_ch, charge_ch[disp_ch]));
+            gr->SetTitle(Form("Event %d (CH%d) - Charge: %.1f, T0: %.1f ns;Sample Index;ADC Value", 
+                              debug_event_id, disp_ch, charge_ch[disp_ch], pulse_start_time_ch[disp_ch]));
             gr->SetLineColor(kBlue);
             gr->Draw("AL");
             c1->Update();

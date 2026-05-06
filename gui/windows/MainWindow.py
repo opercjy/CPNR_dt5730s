@@ -8,7 +8,7 @@ from widgets.DatabaseTab import DatabaseTab
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HEP 3-Tier DAQ Control Center (Pro Edition)")
+        self.setWindowTitle("HEP 3-Tier DAQ Control Center")
         self.resize(1200, 900)
 
         self.tabs = QTabWidget()

@@ -1,4 +1,6 @@
 #include "DAQManager.h"
+#include "EventHeader.h"
+#include "CAENComm.h" 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -14,20 +16,23 @@ DAQManager::DAQManager(const std::string &config_file,
       run_time_sec_(run_time_sec), running_(false),
       digitizer_(CAEN_DGTZ_USB, 0, 0, 0) {
         
+  // [ZMQ Pub Socket 초기화]
   zmq_ctx_ = zmq_ctx_new();
   zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
   int hwm = 5000;
   zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm));
   zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555");
 
+  // [Output File & Buffer 초기화]
   if (!output_file_.empty()) {
-    static std::vector<char> write_buffer(4 * 1024 * 1024);
+    static std::vector<char> write_buffer(4 * 1024 * 1024); // 4MB Buffer
     out_stream_.rdbuf()->pubsetbuf(write_buffer.data(), write_buffer.size());
     out_stream_.open(output_file_, std::ios::binary);
     if (!out_stream_.is_open()) {
       throw std::runtime_error("Cannot open output file: " + output_file_);
     }
   }
+  
   SetupHardware();
 }
 
@@ -39,8 +44,9 @@ DAQManager::~DAQManager() {
 }
 
 void DAQManager::SetupHardware() {
-  std::cout << "[DAQManager] Configuring Hardware from Config...\n";
+  std::cout << "\033[1;36m[DAQManager]\033[0m Configuring Hardware from Config...\n";
   int handle = digitizer_.GetHandle();
+  
   uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
   uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
   uint32_t post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
@@ -50,28 +56,34 @@ void DAQManager::SetupHardware() {
   CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, post_trigger));
 
   int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
-  CAEN_DGTZ_PulsePolarity_t polarity = (pol_val == 0) ? CAEN_DGTZ_PulsePolarityPositive : CAEN_DGTZ_PulsePolarityNegative;
 
   for (int ch = 0; ch < MAX_CH; ++ch) {
       if ((channel_mask >> ch) & 1) {
           std::string ch_sec = "Channel_" + std::to_string(ch);
           uint32_t offset = config_.GetInt(ch_sec, "DCOffset", 7050);
           uint32_t thr = config_.GetInt(ch_sec, "TriggerThreshold", 15000);
+          
           CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(handle, ch, offset));
           CAEN_CHECK(CAEN_DGTZ_SetTriggerPolarity(handle, ch, (pol_val == 0) ? CAEN_DGTZ_TriggerOnRisingEdge : CAEN_DGTZ_TriggerOnFallingEdge));
           CAEN_CHECK(CAEN_DGTZ_SetChannelTriggerThreshold(handle, ch, thr));
       }
   }
 
+  // 획득 모드 및 외부/내부 트리거 설정
   CAEN_DGTZ_TriggerMode_t trg_mode = CAEN_DGTZ_TRGMODE_ACQ_ONLY;
+  
   int ext_trg = config_.GetInt("Digitizer", "ExtTriggerMode", 1);
   if (ext_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, trg_mode));
+  else CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, CAEN_DGTZ_TRGMODE_DISABLED));
   
   int self_trg = config_.GetInt("Digitizer", "SelfTriggerMode", 1);
   if (self_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, channel_mask));
+  else CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
 
   CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, trg_mode));
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
+
+  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard OR Logic (Software Coincidence Ready).\n";
 
   digitizer_.AllocateBuffers();
   
@@ -80,12 +92,13 @@ void DAQManager::SetupHardware() {
 }
 
 void DAQManager::Start(std::atomic<bool>& is_running) {
-  std::cout << "\033[1;32m[DAQManager] Starting Acquisition...\033[0m\n";
+  std::cout << "\033[1;32m[DAQManager]\033[0m Starting Acquisition...\n";
   CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_.GetHandle()));
   AcquisitionLoop(is_running);
 }
 
 void DAQManager::Stop() {
+  running_ = false;
 }
 
 void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
@@ -106,7 +119,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   uint32_t log_events = 0;
   uint32_t zmq_drops = 0;
   size_t total_bytes_written = 0; 
-  size_t last_bytes_written = 0; // 전송 속도 계산용 추가
+  size_t last_bytes_written = 0; 
 
   while (is_running) {
     if (max_events_ > 0 && (int)event_count >= max_events_) break;
@@ -186,8 +199,6 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
     double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
     if (elapsed_ms >= 1000.0) {
       double rate = (log_events / elapsed_ms) * 1000.0;
-      
-      // 데이터 전송 속도 계산 (MB/s)
       double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
       last_bytes_written = total_bytes_written;
 
@@ -215,6 +226,7 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   auto t = std::time(nullptr);
   auto tm = *std::localtime(&t);
   auto run_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
+  
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
             << " - Total Time      : " << run_duration << " seconds\n"
