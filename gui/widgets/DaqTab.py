@@ -3,6 +3,7 @@ import shutil
 import configparser
 import json
 import zmq
+import re
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
                              QGroupBox, QSpinBox, QComboBox, QFileDialog, QCheckBox)
@@ -11,7 +12,6 @@ from PyQt5.QtCore import QTimer, QSettings, QThread, pyqtSignal
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
 
-# 🚀 5555번(B0)과 5556번(B1) 포트 2개를 동시에 수신(Multiplexing)하는 수신기
 class CtrlReceiver(QThread):
     run_completed = pyqtSignal()
     stat_received = pyqtSignal(dict)
@@ -57,7 +57,6 @@ class DaqTab(QWidget):
         super().__init__(parent)
         self.env_data_provider = env_data_provider
         
-        # 🚀 2대의 프로세스를 동시에 담고 관리할 배열 리스트
         self.daq_processes = []
         self.running_processes_count = 0
         self.batch_success = True
@@ -191,7 +190,7 @@ class DaqTab(QWidget):
         btn_layout.addWidget(self.btn_start); btn_layout.addWidget(self.btn_stop); layout.addLayout(btn_layout)
 
         self.terminal = QTextEdit(); self.terminal.setReadOnly(True); self.terminal.setFont(QFont("Monospace", 10))
-        self.terminal.setStyleSheet("background-color: #ffffff; color: #212529; border: 1px solid #ced4da;")
+        self.terminal.setStyleSheet("background-color: #000000; color: #ffffff; border: 1px solid #ced4da;") # 블랙 테마
         self.terminal.setLineWrapMode(QTextEdit.NoWrap) 
         layout.addWidget(self.terminal)
 
@@ -242,9 +241,22 @@ class DaqTab(QWidget):
 
     def append_log(self, text):
         safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        self.terminal.append(safe_text)
-        self.terminal.moveCursor(QTextCursor.End)
-        self.terminal.horizontalScrollBar().setValue(0)
+        
+        # 🚀 C++ ANSI 색상 코드를 HTML 색상으로 변환
+        html_text = safe_text.replace('\033[1;36m', '<span style="color:#0dcaf0; font-weight:bold;">') \
+                             .replace('\033[1;32m', '<span style="color:#28a745; font-weight:bold;">') \
+                             .replace('\033[1;33m', '<span style="color:#ffc107; font-weight:bold;">') \
+                             .replace('\033[1;35m', '<span style="color:#e83e8c; font-weight:bold;">') \
+                             .replace('\033[1;31m', '<span style="color:#dc3545; font-weight:bold;">') \
+                             .replace('\033[1m', '<b>').replace('\033[0m', '</span></b>')
+        
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        html_text = ansi_escape.sub('', html_text)
+        
+        if html_text.strip():
+            self.terminal.append(html_text)
+            self.terminal.moveCursor(QTextCursor.End)
+            self.terminal.horizontalScrollBar().setValue(0)
 
     def update_dashboard(self, stats):
         self.last_stats.update(stats)
@@ -309,21 +321,19 @@ class DaqTab(QWidget):
             }
             if self.env_data_provider: current_env_data.update(self.env_data_provider())
 
-            # DB용 대표 파일 이름 (B0 기준)
             db_output_name = f"{name}_part{self.current_batch:04d}_B0{ext}" if (mode == 1 or self.chk_inf_repeat.isChecked()) else f"{name}_B0{ext}"
             self.current_run_id = self.db.record_run_start(db_output_name, current_env_data, config_full)
             
-            self.append_log(f"\n========== [ DUAL DAQ Batch {self.current_batch} Started ] ==========")
+            self.append_log(f"<br><span style='color:#0dcaf0; font-weight:bold;'>========== [ DUAL DAQ Batch {self.current_batch} Started ] ==========</span>")
             
             exe_path = os.path.join(self.bin_dir, "frontend_dt5730")
 
-            # 🚀 [핵심] 보드 2대를 제어하기 위해 2개의 프로세스를 런칭
+            # 🚀 마이크로서비스: 2개의 C++ 프로세스 독립 런칭
             NUM_BOARDS = 2
             self.daq_processes.clear()
             self.running_processes_count = NUM_BOARDS
 
             for board_idx in range(NUM_BOARDS):
-                # 보드 번호별 파일 분리: _B0.dat, _B1.dat
                 if mode == 1 or self.chk_inf_repeat.isChecked(): 
                     out_file_b = f"{name}_part{self.current_batch:04d}_B{board_idx}{ext}"
                 elif mode == 2:
@@ -338,22 +348,17 @@ class DaqTab(QWidget):
                 port = str(5555 + board_idx)
                 link = str(board_idx)
 
-                # C++ 엔진에 -l과 -p 옵션 주입
                 cmd = [exe_path, "-c", config_path_str, "-o", out_file_b, "-l", link, "-p", port]
                 if self.spin_events.value() > 0: cmd.extend(["-n", str(self.spin_events.value())])
                 if self.spin_time.value() > 0: cmd.extend(["-t", str(self.spin_time.value())])
 
                 proc = ProcessManager(cmd, cwd=self.proj_dir)
-                prefix = f"[Board {board_idx}]"
-                color = "#198754" if board_idx == 0 else "#d63384"
-                
-                # 람다 트릭을 사용하여 0번 보드(초록색), 1번 보드(핑크색)으로 GUI 로그 병렬 출력
-                proc.log_signal.connect(lambda text, p=prefix, c=color: self.append_log(f"<span style='color:{c};'><b>{p}</b></span> {text}"))
+                proc.log_signal.connect(self.append_log)
                 proc.stat_signal.connect(self.update_dashboard)
                 proc.finished_signal.connect(self.on_batch_finished)
                 
                 self.daq_processes.append(proc)
-                proc.start() # OS 백그라운드로 격발
+                proc.start() 
             
             self.watchdog_timer.start(30000)
 
@@ -367,7 +372,6 @@ class DaqTab(QWidget):
         self.append_log("<br><span style='color:#dc3545; font-size:14px;'><b>[FATAL] DAQ Timeout (30s). Killing zombies...</b></span>")
         self.stop_all()
 
-    # 🚀 2개의 프로세스가 '모두' 정상 종료될 때까지 기다림
     def on_batch_finished(self, returncode):
         if returncode != 0:
             self.batch_success = False
@@ -376,7 +380,7 @@ class DaqTab(QWidget):
         
         if self.running_processes_count <= 0:
             self.watchdog_timer.stop() 
-            self.append_log(f">>> All Dual-Board Processes Exited.")
+            self.append_log(f"<br><span style='color:#6c757d; font-weight:bold;'>>>> All Dual-Board Processes Exited.</span>")
             
             if self.current_run_id > 0 and self.last_stats:
                 self.db.update_daq_summary(self.current_run_id, self.last_stats)
@@ -390,10 +394,10 @@ class DaqTab(QWidget):
                     self.current_batch += 1
                     self.run_single_batch()
                 else:
-                    self.append_log("\n========== [ All DAQ Sequences Completed ] ==========")
+                    self.append_log("<br><span style='color:#0dcaf0; font-weight:bold;'>========== [ All DAQ Sequences Completed ] ==========</span>")
                     self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False); self.combo_mode.setEnabled(True)
             else:
-                self.append_log("\n[Warning] Process exited abnormally.")
+                self.append_log("<br><span style='color:#ffc107; font-weight:bold;'>[Warning] Process exited abnormally.</span>")
                 self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False); self.combo_mode.setEnabled(True)
 
     def on_run_completed_received(self):
@@ -405,7 +409,6 @@ class DaqTab(QWidget):
         self.chk_inf_repeat.setChecked(False) 
         self.append_log("<br><span style='color:#dc3545; font-weight:bold;'>[System] DAQ manually stopped.</span>")
         
-        # 🚀 살아있는 모든 워커 프로세스를 종료
         for proc in self.daq_processes:
             if proc and proc.isRunning():
                 proc.stop()
