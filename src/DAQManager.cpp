@@ -7,6 +7,7 @@
 #include <iostream>
 #include <iomanip>
 #include <ctime>
+#include <thread>
 #include <zmq.h>
 
 DAQManager::DAQManager(const std::string &config_file,
@@ -56,34 +57,25 @@ void DAQManager::SetupHardware() {
   uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
   uint32_t conf_post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
 
-  record_length = ((record_length + 7) / 8) * 8; // 8-byte 정렬
+  record_length = ((record_length + 7) / 8) * 8; 
 
-  // =========================================================================
-  // [물리적 하드웨어 지연 보상 로직]
-  // =========================================================================
-  // 1. UI 설정(%)을 바탕으로 논리적인 Pre-trigger 샘플 수 산출
   uint32_t logical_pre_samples = record_length * (100 - conf_post_trigger) / 100;
-  
-  // 2. CAEN DT5730 고유 지연 시간(약 60샘플, 120ns) 보상
   uint32_t hw_pre_samples = logical_pre_samples + 60;
   
-  // 3. RecordLength 오버플로우 방어
-  if (hw_pre_samples >= record_length) {
-      hw_pre_samples = record_length - 8; 
-  }
+  if (hw_pre_samples >= record_length) hw_pre_samples = record_length - 8; 
   
-  // 4. 하드웨어에 최종 인가할 실제 PostTrigger 역산
   uint32_t actual_post_trigger = 100 - (hw_pre_samples * 100 / record_length);
-  // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
-  CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
-  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); // 보정된 값 인가
+  CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask)); 
+  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); 
 
+  uint32_t trigger_mask = config_.GetInt("Digitizer", "TriggerMask", channel_mask); 
+  uint32_t active_hardware_channels = channel_mask | trigger_mask; 
   int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
 
   for (int ch = 0; ch < MAX_CH; ++ch) {
-      if ((channel_mask >> ch) & 1) {
+      if ((active_hardware_channels >> ch) & 1) { 
           std::string ch_sec = "Channel_" + std::to_string(ch);
           uint32_t offset = config_.GetInt(ch_sec, "DCOffset", 7050);
           uint32_t thr = config_.GetInt(ch_sec, "TriggerThreshold", 15000);
@@ -99,14 +91,81 @@ void DAQManager::SetupHardware() {
   if (ext_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, trg_mode));
   else CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, CAEN_DGTZ_TRGMODE_DISABLED));
   
+  int trigger_logic = config_.GetInt("Digitizer", "TriggerLogic", 0); 
   int self_trg = config_.GetInt("Digitizer", "SelfTriggerMode", 1);
-  if (self_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, channel_mask));
-  else CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
+
+  // =========================================================================
+  // [아키텍처 맞춤 교정] DT5730 Pair 로직 + Majority 모순 충돌 해소 
+  // =========================================================================
+  if (self_trg > 0) {
+      CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, trigger_mask));
+      
+      uint32_t trg_src_mask = 0;
+      CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x810C, &trg_src_mask));
+      
+      // DT5730은 8채널 마스크를 4비트의 Pair 마스크(0x810C [3:0])로 압축하여 이해합니다.
+      uint32_t pair_mask = 0;
+      for (int i = 0; i < MAX_CH; ++i) {
+          if ((trigger_mask >> i) & 1) pair_mask |= (1 << (i / 2));
+      }
+
+      trg_src_mask &= ~0xFF; 
+      trg_src_mask |= (pair_mask & 0xFF); 
+
+      // 0x810C 레지스터 초기화 (24~26비트: Majority Level, 20~23비트: Majority Window)
+      trg_src_mask &= ~(0x7 << 24); 
+      trg_src_mask &= ~(0xF << 20); 
+
+      // 사용자의 test.conf 안의 설정 스탠다드 로드
+      int maj_level = config_.GetInt("HardwareCoincidence", "MajorityLevel", -1);
+      int maj_window = config_.GetInt("HardwareCoincidence", "MajorityWindow", 3);
+
+      if (trigger_logic == 1) { // AND (동시성 트리거)
+          if (maj_level >= 0) {
+              trg_src_mask |= ((maj_level & 0x7) << 24);
+              trg_src_mask |= ((maj_window & 0xF) << 20);
+              std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware Coincidence Active. User Level: " << maj_level << " (" << (maj_level+1) << " Pairs required)\n";
+          } else {
+              uint32_t required_pairs = 0;
+              for (int i = 0; i < 4; ++i) { if ((pair_mask >> i) & 1) required_pairs++; }
+              
+              if (required_pairs > 1) {
+                  uint32_t level = required_pairs - 1;
+                  trg_src_mask |= ((level & 0x7) << 24);
+                  trg_src_mask |= ((maj_window & 0xF) << 20);
+                  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware AND Active. Auto Level: " << level << " (" << required_pairs << " Pairs required)\n";
+              } else {
+                  std::cout << "\033[1;33m[FPGA Warning]\033[0m AND logic requested but only 1 Pair active. Forcing OR logic.\n";
+              }
+          }
+      } else { // OR (독립 트리거)
+          // OR 로직일 땐 유저가 MajorityLevel을 2로 적었어도 강제로 Level 0(1 Pair)으로 덮어씌워 락업을 차단합니다.
+          trg_src_mask |= ((maj_window & 0xF) << 20); 
+          std::cout << "\033[1;36m[FPGA Trigger]\033[0m Independent (OR) Logic Active. (Any active Pair triggers)\n";
+      }
+
+      CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x810C, trg_src_mask));
+
+  } else {
+      CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
+      
+      uint32_t trg_src_mask = 0;
+      CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x810C, &trg_src_mask));
+      trg_src_mask &= ~0xFF; 
+      CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x810C, trg_src_mask));
+      
+      std::cout << "\033[1;36m[FPGA Trigger]\033[0m Self-Trigger Disabled (External Only).\n";
+  }
+  // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, trg_mode));
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
 
-  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard OR Logic (Software Coincidence Ready).\n";
+  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard Firmware Logic configuration ready.\n";
+
+  std::cout << "\033[1;33m[Hardware] Waiting 1 second for analog baseline (DAC) to settle...\033[0m\n";
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  CAEN_CHECK(CAEN_DGTZ_ClearData(handle)); 
 
   digitizer_.AllocateBuffers();
   
@@ -151,10 +210,10 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
 
   while (is_running) {
     if (max_events_ > 0 && (int)event_count >= max_events_) break;
-    if (run_time_sec_ > 0) {
-      auto now = std::chrono::steady_clock::now();
-      if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) break;
-    }
+    
+    auto now = std::chrono::steady_clock::now();
+    double current_elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+    if (run_time_sec_ > 0 && current_elapsed_sec >= run_time_sec_) break;
 
     uint32_t bsize = 0; 
 
@@ -220,15 +279,13 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
 
     if (bsize > 0 || ++loop_counter % 10000 == 0) {
         auto now = std::chrono::steady_clock::now();
-        if (run_time_sec_ > 0) {
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) break;
-        }
+        double current_elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+        if (run_time_sec_ > 0 && current_elapsed_sec >= run_time_sec_) break;
 
         double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
         if (elapsed_ms >= 1000.0) {
-            auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            int mins = total_sec / 60;
-            int secs = total_sec % 60;
+            int mins = static_cast<int>(current_elapsed_sec) / 60;
+            int secs = static_cast<int>(current_elapsed_sec) % 60;
 
             double rate = (log_events / elapsed_ms) * 1000.0;
             double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
@@ -237,6 +294,9 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             uint32_t temp_reg = 0, status_reg = 0;
             if (CAEN_DGTZ_ReadRegister(handle, 0x10A8, &temp_reg) == CAEN_DGTZ_Success) {
                 float temp_celsius = static_cast<float>(temp_reg & 0xFF);
+                
+                std::cout << "\n[STATUS] TEMP: " << std::fixed << std::setprecision(1) << temp_celsius << std::endl;
+                
                 if (temp_celsius >= 82.0) {
                     std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
                     is_running = false;
@@ -258,25 +318,23 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
             }
 
             uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
-            uint64_t total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
             
-            double hw_real_time_sec = total_ticks * 8e-9; 
+            double display_real_time = current_elapsed_sec; 
             double dead_time_sec = event_count * (record_length * 2e-9); 
-            double live_time_sec = hw_real_time_sec - dead_time_sec;
+            double live_time_sec = display_real_time - dead_time_sec;
             if (live_time_sec < 0) live_time_sec = 0.0;
             
-            double dead_time_pct = (hw_real_time_sec > 0) ? (dead_time_sec / hw_real_time_sec * 100.0) : 0.0;
+            double dead_time_pct = (display_real_time > 0) ? (dead_time_sec / display_real_time * 100.0) : 0.0;
 
-            std::cout << "\r\033[K\033[1;36m[LIVE DAQ]\033[0m "
+            std::cout << "\033[K\033[1;36m[LIVE DAQ]\033[0m "
                       << "Time: \033[1m" << std::setfill('0') << std::setw(2) << mins << ":" << std::setw(2) << secs << "\033[0m | "
-                      << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << hw_real_time_sec << " s\033[0m | "
+                      << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << display_real_time << " s\033[0m | "
                       << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
                       << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
                       << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " 
                       << "Events: \033[1;33m" << event_count << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
-                      << "Drops: " << zmq_drops
-                      << std::flush;
+                      << "Drops: " << zmq_drops << std::endl;
               
             log_events = 0; zmq_drops = 0; last_log_time = now;
         }
@@ -291,18 +349,14 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   
   uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
   uint64_t final_total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
+  auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
-  double final_real_time_sec = final_total_ticks * 8e-9;
+  double final_real_time_sec = (event_count > 1) ? final_total_ticks * 8e-9 : static_cast<double>(wall_clock_duration);
   double final_dead_time_sec = event_count * (record_length * 2e-9);
   double final_live_time_sec = final_real_time_sec - final_dead_time_sec;
   if (final_live_time_sec < 0) final_live_time_sec = 0.0;
   
   double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
-  auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
-  
-  // =========================================================================
-  // [신규] 평균 트리거 레이트 연산 및 요약본 추가
-  // =========================================================================
   double avg_rate = (final_real_time_sec > 0) ? (event_count / final_real_time_sec) : 0.0;
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"

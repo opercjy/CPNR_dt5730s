@@ -4,7 +4,7 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem,
                              QGroupBox, QSpinBox, QDoubleSpinBox, QHeaderView, 
-                             QFileDialog, QCheckBox, QMessageBox)
+                             QFileDialog, QCheckBox, QMessageBox, QComboBox)
 from PyQt6.QtCore import Qt, QSettings, pyqtSlot
 
 class ConfigTab(QWidget):
@@ -21,6 +21,11 @@ class ConfigTab(QWidget):
         self.current_config_path = ""
         self.config = configparser.ConfigParser()
         self.config.optionxform = str 
+        
+        self.rec_mask_val = 1
+        self.trg_mask_val = 1
+        self.trg_logic_val = 0
+        
         self.setup_ui()
         self.load_settings()
         self.update_mask_calc()
@@ -64,8 +69,11 @@ class ConfigTab(QWidget):
         layout.addLayout(left_layout, stretch=5)
 
         right_layout = QVBoxLayout()
-        mask_group = QGroupBox("Channel Bitmask Calculator (DT5730S 8-Ch)")
+        
+        mask_group = QGroupBox("Channel & Trigger Logic Config (DT5730S)")
         mask_vbox = QVBoxLayout()
+        
+        mask_vbox.addWidget(QLabel("<b>1. Record Mask</b> (Channels to save):"))
         chk_layout = QGridLayout()
         self.ch_checks = []
         for i in range(8):
@@ -75,13 +83,35 @@ class ConfigTab(QWidget):
             chk_layout.addWidget(chk, i//4, i%4)
             self.ch_checks.append(chk)
         mask_vbox.addLayout(chk_layout)
+        
+        mask_vbox.addWidget(QLabel("<b>2. Trigger Mask</b> (Channels that trigger):"))
+        trg_chk_layout = QGridLayout()
+        self.trg_checks = []
+        for i in range(8):
+            chk = QCheckBox(f"CH{i}")
+            if i == 0: chk.setChecked(True)
+            chk.stateChanged.connect(self.update_mask_calc)
+            trg_chk_layout.addWidget(chk, i//4, i%4)
+            self.trg_checks.append(chk)
+        mask_vbox.addLayout(trg_chk_layout)
+
+        logic_layout = QHBoxLayout()
+        logic_layout.addWidget(QLabel("<b>3. Logic:</b>"))
+        self.combo_logic = QComboBox()
+        self.combo_logic.addItems(["OR (Independent)", "AND (Hardware Coincidence)"])
+        self.combo_logic.currentIndexChanged.connect(self.update_mask_calc)
+        logic_layout.addWidget(self.combo_logic)
+        mask_vbox.addLayout(logic_layout)
+
         res_mask_layout = QHBoxLayout()
-        res_mask_layout.addWidget(QLabel("Decimal Mask Value:"))
-        self.lbl_mask_res = QLabel("1")
-        self.btn_apply_mask = QPushButton("Apply Mask")
+        self.lbl_mask_res = QLabel("Rec: 1 | Trg: 1 | OR")
+        self.lbl_mask_res.setStyleSheet("color: #dc3545; font-weight: bold;")
+        self.btn_apply_mask = QPushButton("Apply to Config")
         self.btn_apply_mask.clicked.connect(self.apply_mask_to_table)
         res_mask_layout.addWidget(self.lbl_mask_res); res_mask_layout.addWidget(self.btn_apply_mask)
-        mask_vbox.addLayout(res_mask_layout); mask_group.setLayout(mask_vbox)
+        mask_vbox.addLayout(res_mask_layout)
+        
+        mask_group.setLayout(mask_vbox)
         right_layout.addWidget(mask_group)
 
         time_group = QGroupBox("Time & DSP Calculator (500 MS/s = 2 ns/Sample)")
@@ -135,37 +165,28 @@ class ConfigTab(QWidget):
         self.plot_sim.addItem(self.line_base)
         self.plot_sim.addItem(self.line_trg)
 
-        # ====================================================================
-        # [신규 추가] 스캔 범위를 표시할 수평 방향 반투명 면적 시각화
-        # ====================================================================
         self.scan_region = pg.LinearRegionItem(orientation='horizontal', brush=pg.mkBrush(0, 100, 255, 50), movable=False)
         self.scan_region.setRegion([14000, 14500])
         self.scan_region.hide() 
         self.plot_sim.addItem(self.scan_region)
-        # ====================================================================
 
         sim_vbox.addWidget(self.plot_sim)
         sim_group.setLayout(sim_vbox)
         right_layout.addWidget(sim_group, stretch=1)
         layout.addLayout(right_layout, stretch=3)
 
-    # ====================================================================
-    # [신규 추가] DaqTab 스캔 관련 시그널 수신 슬롯
-    # ====================================================================
     @pyqtSlot(int, int)
     def update_scan_region(self, start_val, end_val):
         self.scan_region.setRegion([start_val, end_val])
-        
         current_baseline = self.line_base.value()
         if start_val > (current_baseline - 15) or end_val > (current_baseline - 15):
-            self.scan_region.setBrush(pg.mkBrush(255, 0, 0, 70))  # 위험
+            self.scan_region.setBrush(pg.mkBrush(255, 0, 0, 70))
         else:
-            self.scan_region.setBrush(pg.mkBrush(0, 100, 255, 50)) # 안전
+            self.scan_region.setBrush(pg.mkBrush(0, 100, 255, 50))
 
     @pyqtSlot(bool)
     def toggle_scan_region_visibility(self, is_visible):
         self.scan_region.setVisible(is_visible)
-    # ====================================================================
 
     def load_settings(self):
         saved_path = self.settings.value("last_loaded_config", "")
@@ -192,18 +213,30 @@ class ConfigTab(QWidget):
                 self.table.insertRow(row)
                 self.table.setItem(row, 0, QTableWidgetItem(section)); self.table.setItem(row, 1, QTableWidgetItem(key))
                 self.table.setItem(row, 2, QTableWidgetItem(val))
+        
         try:
-            mask_val = int(self.config.get("Digitizer", "ChannelMask", fallback="1"))
-            for i, chk in enumerate(self.ch_checks): chk.setChecked(bool((mask_val >> i) & 1))
+            rec_val = int(self.config.get("Digitizer", "ChannelMask", fallback="1"))
+            trg_val = int(self.config.get("Digitizer", "TriggerMask", fallback=str(rec_val)))
+            logic_val = int(self.config.get("Digitizer", "TriggerLogic", fallback="0"))
+            
+            for i, chk in enumerate(self.ch_checks): chk.setChecked(bool((rec_val >> i) & 1))
+            for i, chk in enumerate(self.trg_checks): chk.setChecked(bool((trg_val >> i) & 1))
+            if 0 <= logic_val < self.combo_logic.count():
+                self.combo_logic.setCurrentIndex(logic_val)
         except: pass
 
     def update_mask_calc(self):
-        mask = sum((1 << i) for i, chk in enumerate(self.ch_checks) if chk.isChecked())
-        self.lbl_mask_res.setText(str(mask))
+        self.rec_mask_val = sum((1 << i) for i, chk in enumerate(self.ch_checks) if chk.isChecked())
+        self.trg_mask_val = sum((1 << i) for i, chk in enumerate(self.trg_checks) if chk.isChecked())
+        self.trg_logic_val = self.combo_logic.currentIndex()
+        logic_str = "OR" if self.trg_logic_val == 0 else "AND"
+        self.lbl_mask_res.setText(f"Rec: {self.rec_mask_val} | Trg: {self.trg_mask_val} | {logic_str}")
 
     def apply_mask_to_table(self):
         if self.table.rowCount() == 0: return
-        self.set_table_value("Digitizer", "ChannelMask", self.lbl_mask_res.text())
+        self.set_table_value("Digitizer", "ChannelMask", str(self.rec_mask_val))
+        self.set_table_value("Digitizer", "TriggerMask", str(self.trg_mask_val))
+        self.set_table_value("Digitizer", "TriggerLogic", str(self.trg_logic_val))
 
     def update_time_simulator(self):
         rec_len = self.spin_record.value()
@@ -211,9 +244,6 @@ class ConfigTab(QWidget):
         dt_ns = 2.0 
         total_time_ns = rec_len * dt_ns
         
-        # ====================================================================
-        # [제1원리 보정] 하드웨어 트리거 래치 지연시간(120 ns) 선행 보상
-        # ====================================================================
         intrinsic_latency_ns = 120.0
         required_pre_ns = target_t0_ns + intrinsic_latency_ns
 
@@ -234,6 +264,7 @@ class ConfigTab(QWidget):
         self.calculated_post_pct = post_pct
         self.calculated_pedestal = recommended_pedestal
 
+    # === [복구 완료] 시간 관련 설정을 테이블에 적용하는 함수 ===
     def apply_time_to_table(self):
         if self.table.rowCount() == 0: return
         self.set_table_value("Digitizer", "RecordLength", str(self.spin_record.value()))
@@ -244,7 +275,8 @@ class ConfigTab(QWidget):
     def update_adc_simulator(self):
         base_pct = self.spin_base_pct.value() / 100.0
         trg_mv = self.spin_trg_mv.value()
-        dac_offset = int((1.0 - base_pct) * 65535)
+        
+        dac_offset = int(base_pct * 65535) 
         adc_baseline = int(base_pct * 16383)
         adc_trg_drop = int(trg_mv / 0.12207) 
         adc_trigger = adc_baseline - adc_trg_drop
@@ -254,7 +286,6 @@ class ConfigTab(QWidget):
         self.line_base.setValue(adc_baseline)
         self.line_trg.setValue(adc_trigger)
         
-        # 베이스라인이 바뀔 때 스캔 영역의 경고 여부도 재평가
         if hasattr(self, 'scan_region') and self.scan_region.isVisible():
             r = self.scan_region.getRegion()
             self.update_scan_region(int(r[0]), int(r[1]))
@@ -263,16 +294,16 @@ class ConfigTab(QWidget):
         if self.table.rowCount() == 0: return
         base_pct = self.spin_base_pct.value() / 100.0
         trg_mv = self.spin_trg_mv.value()
-        calc_offset = str(int((1.0 - base_pct) * 65535))
+        
+        calc_offset = str(int(base_pct * 65535))
         calc_trg = str(int((base_pct * 16383) - (trg_mv / 0.12207)))
-        for row in range(self.table.rowCount()):
-            section = self.table.item(row, 0).text()
-            param = self.table.item(row, 1).text()
-            if section.startswith("Channel_"):
-                if param == "DCOffset" or param == "TriggerThreshold":
-                    val = calc_offset if param == "DCOffset" else calc_trg
-                    self.table.setItem(row, 2, QTableWidgetItem(val))
-                    self.table.item(row, 2).setBackground(Qt.GlobalColor.yellow)
+        
+        active_hardware_mask = self.rec_mask_val | self.trg_mask_val
+        for ch in range(8):
+            if (active_hardware_mask >> ch) & 1:
+                section_name = f"Channel_{ch}"
+                self.set_table_value(section_name, "DCOffset", calc_offset)
+                self.set_table_value(section_name, "TriggerThreshold", calc_trg)
 
     def set_table_value(self, target_section, target_param, value):
         for row in range(self.table.rowCount()):

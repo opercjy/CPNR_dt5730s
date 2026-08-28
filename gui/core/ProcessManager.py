@@ -46,11 +46,6 @@ class ProcessManager(QThread):
                     if "[FATAL] OVER_TEMP_SOFT_KILL" in clean_line:
                         self.fatal_signal.emit("OVER_TEMP_SOFT_KILL")
                         
-                    # =========================================================================
-                    # [핵심 방어] 스트림 문자열 엉킴 방지 
-                    # elif 대신 독립된 if문을 사용하여, 한 줄에 DAQ, TEMP, LED가 모두 엉겨있어도 
-                    # 빠짐없이 캐치하여 UI로 발송합니다.
-                    # =========================================================================
                     if "[STATUS] TEMP:" in clean_line:
                         m = self.re_temp.search(clean_line)
                         if m: self.temp_signal.emit(float(m.group(1)))
@@ -70,7 +65,6 @@ class ProcessManager(QThread):
                     if "[LIVE DAQ]" in clean_line:
                         self._parse_and_emit_stats(clean_line)
                     
-                    # 일반 로그 출력 (충돌된 지저분한 상태 로그는 터미널에 보이지 않도록 필터링)
                     if "[LIVE DAQ]" not in clean_line and "[STATUS]" not in clean_line and "[FATAL]" not in clean_line:
                         self.log_signal.emit(clean_line)
             
@@ -83,11 +77,6 @@ class ProcessManager(QThread):
             self.is_running = False
 
     def _parse_and_emit_stats(self, line):
-        """
-        [정규식 기반 핀셋 추출] 
-        문자열 스플릿의 취약점을 폐기하고 Regex를 도입하여,
-        뒤에 어떤 쓰레기 문자가 섞여 들어와도 오직 '숫자'만 안전하게 추출합니다.
-        """
         try:
             stats = {}
             if "Live:" in line:
@@ -111,7 +100,6 @@ class ProcessManager(QThread):
                 if m: stats['speed'] = f"{m.group(1)} MB/s"
                 
             if "Drops:" in line:
-                # 텍스트 엉김의 주범이었던 Drops 값을 정규식으로 안전하게 추출 ('0[STATUS] LED...' -> '0')
                 m = re.search(r"Drops:\s*(\d+)", line)
                 if m: stats['drops'] = m.group(1)
 

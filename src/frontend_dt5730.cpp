@@ -11,7 +11,7 @@ std::atomic<bool> g_is_running{true};
 
 void sig_handler(int) {
     std::cout << "\n\033[1;33m[Interrupt] Catching Signal. Stopping DAQ Gracefully...\033[0m\n";
-    g_is_running = false; // 플래그만 false로 변경
+    g_is_running = false; 
 }
 
 void PrintConfigContent(const std::string& filepath) {
@@ -53,7 +53,6 @@ int main(int argc, char** argv) {
 
         DAQManager daq(config_file, output_file, max_events, run_time_sec);
         
-        // 메인 루프에 플래그 전달
         daq.Start(g_is_running);
 
     } catch (const std::exception& e) {

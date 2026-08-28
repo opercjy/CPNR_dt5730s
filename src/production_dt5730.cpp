@@ -1,4 +1,5 @@
 #include "EventHeader.h"
+#include "ConfigParser.h" 
 #include <TApplication.h>
 #include <TCanvas.h>
 #include <TFile.h>
@@ -64,6 +65,16 @@ int main(int argc, char **argv) {
         } else {
             output_file = input_file.substr(0, last_dot) + "_prod.root";
         }
+    }
+
+    uint32_t config_post_trigger = 80;
+    uint32_t config_baseline_samples = 40;
+    if (!config_file.empty()) {
+        ConfigParser parser(config_file);
+        config_post_trigger = parser.GetInt("Digitizer", "PostTrigger", 80);
+        config_baseline_samples = parser.GetInt("SoftwareDSP", "BaselineSamples", 40);
+        std::cout << "\033[1;36m[Production]\033[0m Loaded Config -> PostTrigger: " << config_post_trigger 
+                  << "%, BaselineSamples: " << config_baseline_samples << "\n";
     }
 
     std::signal(SIGINT, sig_handler);
@@ -183,19 +194,25 @@ int main(int argc, char **argv) {
                 size_t trace_len = header.RecordLength;
 
                 if (trace_len > 0) {
+                    size_t logical_pre_samples = (trace_len * (100 - config_post_trigger)) / 100;
+                    size_t baseline_samples = config_baseline_samples;
+                    
+                    if (baseline_samples > logical_pre_samples) {
+                        baseline_samples = (logical_pre_samples > 5) ? logical_pre_samples - 5 : 1;
+                    }
+                    if (baseline_samples == 0) baseline_samples = 1;
+
                     size_t init_window = std::min((size_t)5, trace_len);
                     double init_base = 0.0;
                     for (size_t i = 0; i < init_window; ++i) init_base += trace_ptr[i];
                     init_base /= init_window;
 
-                    size_t baseline_samples = trace_len / 4; 
-                    for (size_t i = init_window; i < trace_len; ++i) {
+                    for (size_t i = init_window; i < baseline_samples; ++i) {
                         if (init_base - trace_ptr[i] > 30.0) { 
                             baseline_samples = (i > 5) ? i - 5 : 1; 
                             break;
                         }
                     }
-                    if (baseline_samples > 150) baseline_samples = 150; 
                     
                     double baseline = 0.0;
                     for(size_t i = 0; i < baseline_samples; ++i) {
@@ -204,9 +221,6 @@ int main(int argc, char **argv) {
                     baseline /= baseline_samples;
                     baseline_ch[ch] = baseline;
 
-                    // ====================================================================
-                    // [핵심 교정] 노이즈 상쇄(Zero-Sum) 무조건 적분
-                    // ====================================================================
                     double charge = 0.0;
                     double min_adc = baseline; 
                     
@@ -219,7 +233,6 @@ int main(int argc, char **argv) {
                     
                     charge_ch[ch] = (charge > 0) ? charge : 0.0;
                     pulse_height_ch[ch] = (baseline - min_adc > 0) ? (baseline - min_adc) : 0.0; 
-                    // ====================================================================
 
                     double trigger_threshold = baseline - 30.0; 
                     for(size_t i = baseline_samples; i < trace_len; ++i) {
@@ -313,7 +326,6 @@ int main(int argc, char **argv) {
         double lost_events_pct = (total_triggers > 0) ? (static_cast<double>(lost_events) / total_triggers * 100.0) : 0.0;
         double dead_time_pct = (real_time_sec > 0) ? (dead_time_sec / real_time_sec * 100.0) : 0.0;
         
-        // [신규 추가] 오프라인 평균 레이트 연산
         double avg_rate = (real_time_sec > 0) ? (current_event / real_time_sec) : 0.0;
 
         std::cout << "\n\033[1;36m========== [ ROOT Conversion Summary ] ==========\033[0m\n"
@@ -332,7 +344,6 @@ int main(int argc, char **argv) {
             TParameter<double> p_dead("DeadTime_pct", dead_time_pct);
             TParameter<int> p_lost("LostEvents_count", lost_events);
             TParameter<int> p_rec("RecordedEvents_count", current_event);
-            // [신규 추가] ROOT 내부 영구 저장
             TParameter<double> p_rate("TriggerRate_Hz", avg_rate); 
             
             p_real.Write(); p_live.Write(); p_dead.Write(); p_lost.Write(); p_rec.Write(); p_rate.Write();
