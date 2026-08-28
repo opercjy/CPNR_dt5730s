@@ -54,32 +54,31 @@ void DAQManager::SetupHardware() {
 
   uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
   uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
-  uint32_t post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
+  uint32_t conf_post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
 
-  record_length = ((record_length + 7) / 8) * 8; 
+  record_length = ((record_length + 7) / 8) * 8; // 8-byte 정렬
 
-  uint32_t pre_trigger_ns = record_length * (100 - post_trigger) * 2 / 100;
+  // =========================================================================
+  // [물리적 하드웨어 지연 보상 로직]
+  // =========================================================================
+  // 1. UI 설정(%)을 바탕으로 논리적인 Pre-trigger 샘플 수 산출
+  uint32_t logical_pre_samples = record_length * (100 - conf_post_trigger) / 100;
   
-  if (pre_trigger_ns < 160) { 
-      std::cerr << "\n\033[1;33m[Warning] Pre-trigger window (" << pre_trigger_ns 
-                << " ns) is too close to the DT5730 hardware latency limit (~150 ns).\033[0m\n";
-      
-      uint32_t required_pre_pct = (160 * 100 + (record_length * 2 - 1)) / (record_length * 2);
-      
-      if (required_pre_pct >= 100) {
-          std::cerr << "\033[1;31m[Error] RecordLength (" << record_length << " Samples) is fundamentally too short.\033[0m\n";
-          record_length = 512;
-          post_trigger = 80;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusted RecordLength to 512 and PostTrigger to 80%.\033[0m\n";
-      } else {
-          post_trigger = 100 - required_pre_pct;
-          std::cerr << "\033[1;33m[Warning] Auto-adjusting PostTrigger dynamically to " << post_trigger << "% to secure baseline.\033[0m\n";
-      }
+  // 2. CAEN DT5730 고유 지연 시간(약 60샘플, 120ns) 보상
+  uint32_t hw_pre_samples = logical_pre_samples + 60;
+  
+  // 3. RecordLength 오버플로우 방어
+  if (hw_pre_samples >= record_length) {
+      hw_pre_samples = record_length - 8; 
   }
+  
+  // 4. 하드웨어에 최종 인가할 실제 PostTrigger 역산
+  uint32_t actual_post_trigger = 100 - (hw_pre_samples * 100 / record_length);
+  // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
   CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
-  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, post_trigger));
+  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); // 보정된 값 인가
 
   int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
 
@@ -301,6 +300,9 @@ void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
   double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
   auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
+  // =========================================================================
+  // [신규] 평균 트리거 레이트 연산 및 요약본 추가
+  // =========================================================================
   double avg_rate = (final_real_time_sec > 0) ? (event_count / final_real_time_sec) : 0.0;
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"

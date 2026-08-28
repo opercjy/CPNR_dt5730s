@@ -73,6 +73,10 @@ class ProcessManager(QThread):
             self.is_running = False
 
     def _parse_and_emit_stats(self, line):
+        """
+        [핵심 수정] 백엔드에서 쏟아지는 '[LIVE DAQ]' 스트림을 파싱하여 UI 대시보드로 전달.
+        과거 코드에서 버려지던 Rate와 Drops 항목에 대한 낚아채기(Parsing) 로직을 완벽 복원.
+        """
         try:
             stats = {}
             parts = line.split("|")
@@ -85,6 +89,14 @@ class ProcessManager(QThread):
                     stats['events'] = part.split("Events:")[1].strip()
                 elif "Speed:" in part:
                     stats['speed'] = part.split("Speed:")[1].strip()
+                # =========================================================
+                # [버그 픽스] 누락되었던 Rate 및 Drops 파싱 로직 추가
+                # =========================================================
+                elif "Rate:" in part:
+                    stats['rate'] = part.split("Rate:")[1].strip()
+                elif "Drops:" in part:
+                    stats['drops'] = part.split("Drops:")[1].strip()
+                # =========================================================
             self.stat_signal.emit(stats)
         except Exception:
             pass
