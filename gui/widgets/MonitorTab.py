@@ -2,7 +2,9 @@ import struct
 import numpy as np
 import pyqtgraph as pg
 import zmq
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox, QProgressBar, QMessageBox
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QComboBox, 
+                             QLabel, QPushButton, QSpinBox, QProgressBar, 
+                             QMessageBox, QCheckBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from collections import deque
 
@@ -17,6 +19,7 @@ class MonitorTab(QWidget):
         self.curves_wave = {}   
         self.curves_qlong = {}  
         self.q_long_hists = {}  
+        self.ch_cbs = {} # 채널별 체크박스 객체 저장소
         
         self.colors = [
             '#0d6efd', '#198754', '#dc3545', '#fd7e14', 
@@ -41,6 +44,7 @@ class MonitorTab(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
+        # 1. 상단 컨트롤 패널
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(QLabel("<b>Display Engine:</b>"))
         
@@ -49,7 +53,6 @@ class MonitorTab(QWidget):
         self.cb_monitor.currentIndexChanged.connect(self.toggle_monitor)
         ctrl_layout.addWidget(self.cb_monitor)
 
-        # [요구사항 반영] 스펙트럼 분석 모드 콤보박스 (적분 면적 vs 펄스 높이)
         ctrl_layout.addWidget(QLabel("  |  <b>Analysis Mode:</b>"))
         self.cb_spec_mode = QComboBox()
         self.cb_spec_mode.addItems(["📊 Pulse Charge (Integral Area)", "📈 Pulse Height (Amplitude)"])
@@ -81,6 +84,27 @@ class MonitorTab(QWidget):
         ctrl_layout.addStretch() 
         layout.addLayout(ctrl_layout)
 
+        # =========================================================================
+        # [신규 추가] 채널별 렌더링 가시성(Visibility) 토글 체크박스
+        # =========================================================================
+        vis_layout = QHBoxLayout()
+        vis_layout.addWidget(QLabel("<b>Channel Visibility:</b>"))
+        
+        for i in range(8):
+            cb = QCheckBox(f"CH {i}")
+            cb.setChecked(True)
+            cb.setEnabled(False) # 데이터가 들어와서 활성화되기 전까지 잠금
+            # 채널 색상과 동일하게 라벨 색상 부여
+            cb.setStyleSheet(f"QCheckBox {{ color: {self.colors[i]}; font-weight: bold; margin-right: 10px; }}")
+            cb.stateChanged.connect(lambda state, ch=i: self.toggle_channel_visibility(ch, state))
+            vis_layout.addWidget(cb)
+            self.ch_cbs[i] = cb
+            
+        vis_layout.addStretch()
+        layout.addLayout(vis_layout)
+        # =========================================================================
+
+        # 2. PyQtGraph 캔버스 설정
         pg.setConfigOptions(antialias=True, background='#f8f9fa', foreground='#212529')
         self.glw = pg.GraphicsLayoutWidget()
         layout.addWidget(self.glw)
@@ -97,9 +121,17 @@ class MonitorTab(QWidget):
         self.plot_qlong.setLabel('left', "Counts (Log)")
         self.plot_qlong.addLegend(offset=(10, 10))
 
+    @pyqtSlot(int, int)
+    def toggle_channel_visibility(self, ch, state):
+        """체크박스 상태에 따라 파형과 스펙트럼 곡선을 숨기거나 표시합니다."""
+        is_visible = (state == Qt.CheckState.Checked.value)
+        if ch in self.curves_wave:
+            self.curves_wave[ch].setVisible(is_visible)
+        if ch in self.curves_qlong:
+            self.curves_qlong[ch].setVisible(is_visible)
+
     @pyqtSlot(int)
     def toggle_spec_mode(self, idx):
-        """스펙트럼 모드 콤보박스 변경 시 타이틀 및 라벨 변경, 데이터 강제 초기화"""
         if idx == 0:
             self.plot_qlong.setTitle("Real-time Computed Charge Spectrum")
             self.plot_qlong.setLabel('bottom', "Integrated Charge (ADC Bins)")
@@ -141,21 +173,28 @@ class MonitorTab(QWidget):
         self.curves_qlong.clear()
         self.q_long_hists.clear()
         
+        # 모든 체크박스 초기화
+        for i in range(8):
+            self.ch_cbs[i].setEnabled(False)
+            
         active_channels = [i for i in range(8) if (mask >> i) & 1]
         
         for ch in active_channels:
-            color = self.colors[ch % len(self.colors)]
+            # 해당 채널의 체크박스 활성화
+            self.ch_cbs[ch].setEnabled(True)
             
+            color = self.colors[ch % len(self.colors)]
             pen = pg.mkPen(color, width=1.5)
             self.curves_wave[ch] = self.plot_wave.plot(name=f"CH {ch}", pen=pen)
             
             brush = pg.mkColor(color)
             brush.setAlpha(100)
             
-            # stepMode=True 요구 조건 (len(x) == len(y) + 1)
             self.curves_qlong[ch] = self.plot_qlong.plot(name=f"CH {ch}", stepMode=True, fillLevel=0.1, brush=brush, pen=color)
-            
             self.q_long_hists[ch] = deque(maxlen=self.spin_history.value())
+            
+            # 체크박스 상태에 따라 가시성 즉각 적용
+            self.toggle_channel_visibility(ch, self.ch_cbs[ch].checkState().value)
 
     def toggle_monitor(self, idx):
         if idx == 0:
@@ -172,7 +211,6 @@ class MonitorTab(QWidget):
             if ch in self.curves_wave:
                 self.curves_wave[ch].setData(np.array([], dtype=np.uint16))
             if ch in self.curves_qlong:
-                # [버그 픽스 1] 초기화 시 길이 규칙(x=2, y=1) 강제하여 차원 불일치 에러 방지
                 self.curves_qlong[ch].setData(x=np.array([-0.5, 0.5]), y=np.array([0.1]))
 
     def poll_zmq(self):
@@ -195,32 +233,31 @@ class MonitorTab(QWidget):
                 spec_mode = self.cb_spec_mode.currentIndex()
                 
                 for idx, ch in enumerate(active_channels):
+                    # 가시성 체크박스가 꺼져 있다면 스펙트럼 적분 연산도 생략하여 CPU 절약
+                    if not self.ch_cbs[ch].isChecked():
+                        continue
+
                     offset = HEADER_SIZE + (idx * record_len * 2)
                     wave_bytes = msg[offset : offset + (record_len * 2)]
                     
                     if wave_bytes:
                         wave_arr = np.frombuffer(wave_bytes, dtype=np.uint16)
                         if len(wave_arr) > 20: 
-                            # [핵심] 스마트 베이스라인 알고리즘
-                            # 파형에서 가장 깊게 파인 곳(최소값)의 인덱스를 스스로 찾음
                             min_idx = int(np.argmin(wave_arr))
                             
-                            # 펄스가 발생하기 직전의 평탄한 영역만을 베이스라인으로 설정하여 왜곡 방지
                             if min_idx > 10:
                                 baseline_end = min(record_len // 4, min_idx - 5)
                             else:
                                 baseline_end = 10
                                 
-                            baseline_end = max(5, baseline_end) # 최소 5샘플 방어 로직
+                            baseline_end = max(5, baseline_end) 
                             baseline = np.mean(wave_arr[:baseline_end])
 
                             val = 0.0
                             if spec_mode == 0:
-                                # Mode 0: Pulse Charge (면적 적분) - 베이스라인보다 아래로 파인 음극성 면적만 모두 적분
                                 pulse_region = wave_arr[wave_arr < baseline]
                                 val = np.sum(baseline - pulse_region)
                             else:
-                                # Mode 1: Pulse Height (진폭 높이) - 베이스라인과 최소값의 깊이 차이
                                 val = baseline - wave_arr[min_idx]
 
                             if val > 0: 
@@ -235,6 +272,9 @@ class MonitorTab(QWidget):
             active_channels = [i for i in range(8) if (mask >> i) & 1]
             
             for idx, ch in enumerate(active_channels):
+                if not self.ch_cbs[ch].isChecked():
+                    continue
+
                 if ch in self.curves_wave:
                     offset = HEADER_SIZE + (idx * record_len * 2)
                     wave_bytes = latest_msg[offset : offset + (record_len * 2)]
@@ -242,18 +282,18 @@ class MonitorTab(QWidget):
                         wave_arr = np.frombuffer(wave_bytes, dtype=np.uint16)
                         self.curves_wave[ch].setData(wave_arr)
                         
-            # [버그 픽스 2] 히스토그램 X,Y 배열 차원 불일치 에러 완벽 해결
             for ch in self.curves_qlong:
+                if not self.ch_cbs[ch].isChecked():
+                    continue
+
                 hist_data = self.q_long_hists[ch]
                 if len(hist_data) > 5:
                     data_min, data_max = min(hist_data), max(hist_data)
                     if data_min == data_max: 
                         continue 
                         
-                    # np.histogram은 x_edges 길이를 y보다 1 크게 반환함 (151개, 150개)
-                    # 변환 없이 그대로 setData에 넘겨주어 stepMode=True 조건을 완벽하게 만족시킴
                     y, x_edges = np.histogram(hist_data, bins=150)
-                    y = np.where(y == 0, 0.1, y) # Log 스케일 에러 방지 (0점 바닥 띄우기)
+                    y = np.where(y == 0, 0.1, y) 
                     
                     self.curves_qlong[ch].setData(x=x_edges, y=y)
 

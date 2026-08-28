@@ -94,16 +94,12 @@ void DAQManager::SetupHardware() {
   int trigger_logic = config_.GetInt("Digitizer", "TriggerLogic", 0); 
   int self_trg = config_.GetInt("Digitizer", "SelfTriggerMode", 1);
 
-  // =========================================================================
-  // [아키텍처 맞춤 교정] DT5730 Pair 로직 + Majority 모순 충돌 해소 
-  // =========================================================================
   if (self_trg > 0) {
       CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, trigger_mask));
       
       uint32_t trg_src_mask = 0;
       CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x810C, &trg_src_mask));
       
-      // DT5730은 8채널 마스크를 4비트의 Pair 마스크(0x810C [3:0])로 압축하여 이해합니다.
       uint32_t pair_mask = 0;
       for (int i = 0; i < MAX_CH; ++i) {
           if ((trigger_mask >> i) & 1) pair_mask |= (1 << (i / 2));
@@ -112,34 +108,32 @@ void DAQManager::SetupHardware() {
       trg_src_mask &= ~0xFF; 
       trg_src_mask |= (pair_mask & 0xFF); 
 
-      // 0x810C 레지스터 초기화 (24~26비트: Majority Level, 20~23비트: Majority Window)
       trg_src_mask &= ~(0x7 << 24); 
       trg_src_mask &= ~(0xF << 20); 
 
-      // 사용자의 test.conf 안의 설정 스탠다드 로드
       int maj_level = config_.GetInt("HardwareCoincidence", "MajorityLevel", -1);
       int maj_window = config_.GetInt("HardwareCoincidence", "MajorityWindow", 3);
 
-      if (trigger_logic == 1) { // AND (동시성 트리거)
+      uint32_t active_pairs = 0;
+      for (int i = 0; i < 4; ++i) { if ((pair_mask >> i) & 1) active_pairs++; }
+
+      if (trigger_logic == 1) { 
           if (maj_level >= 0) {
+              if ((uint32_t)maj_level >= active_pairs) {
+                  std::cout << "\033[1;31m[FPGA Warning]\033[0m User MajorityLevel " << maj_level 
+                            << " requires " << (maj_level + 1) << " Pairs, but only " << active_pairs 
+                            << " Pairs are active! Forcing Level to " << (active_pairs > 0 ? active_pairs - 1 : 0) << "\n";
+                  maj_level = (active_pairs > 0) ? active_pairs - 1 : 0;
+              }
               trg_src_mask |= ((maj_level & 0x7) << 24);
               trg_src_mask |= ((maj_window & 0xF) << 20);
-              std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware Coincidence Active. User Level: " << maj_level << " (" << (maj_level+1) << " Pairs required)\n";
           } else {
-              uint32_t required_pairs = 0;
-              for (int i = 0; i < 4; ++i) { if ((pair_mask >> i) & 1) required_pairs++; }
-              
-              if (required_pairs > 1) {
-                  uint32_t level = required_pairs - 1;
-                  trg_src_mask |= ((level & 0x7) << 24);
-                  trg_src_mask |= ((maj_window & 0xF) << 20);
-                  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware AND Active. Auto Level: " << level << " (" << required_pairs << " Pairs required)\n";
-              } else {
-                  std::cout << "\033[1;33m[FPGA Warning]\033[0m AND logic requested but only 1 Pair active. Forcing OR logic.\n";
-              }
+              uint32_t level = (active_pairs > 0) ? active_pairs - 1 : 0;
+              trg_src_mask |= ((level & 0x7) << 24);
+              trg_src_mask |= ((maj_window & 0xF) << 20);
           }
-      } else { // OR (독립 트리거)
-          // OR 로직일 땐 유저가 MajorityLevel을 2로 적었어도 강제로 Level 0(1 Pair)으로 덮어씌워 락업을 차단합니다.
+          std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware Coincidence (AND) Logic Active. Required Pairs: " << ((trg_src_mask >> 24 & 0x7) + 1) << "\n";
+      } else { 
           trg_src_mask |= ((maj_window & 0xF) << 20); 
           std::cout << "\033[1;36m[FPGA Trigger]\033[0m Independent (OR) Logic Active. (Any active Pair triggers)\n";
       }
@@ -156,7 +150,6 @@ void DAQManager::SetupHardware() {
       
       std::cout << "\033[1;36m[FPGA Trigger]\033[0m Self-Trigger Disabled (External Only).\n";
   }
-  // =========================================================================
 
   CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, trg_mode));
   CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));

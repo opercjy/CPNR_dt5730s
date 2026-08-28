@@ -264,7 +264,6 @@ class ConfigTab(QWidget):
         self.calculated_post_pct = post_pct
         self.calculated_pedestal = recommended_pedestal
 
-    # === [복구 완료] 시간 관련 설정을 테이블에 적용하는 함수 ===
     def apply_time_to_table(self):
         if self.table.rowCount() == 0: return
         self.set_table_value("Digitizer", "RecordLength", str(self.spin_record.value()))
@@ -276,7 +275,9 @@ class ConfigTab(QWidget):
         base_pct = self.spin_base_pct.value() / 100.0
         trg_mv = self.spin_trg_mv.value()
         
-        dac_offset = int(base_pct * 65535) 
+        # 🚨 [물리적 하드웨어 특성 롤백] CAEN DCOffset은 하향(Inverse) 비례.
+        dac_offset = int((1.0 - base_pct) * 65535)
+        
         adc_baseline = int(base_pct * 16383)
         adc_trg_drop = int(trg_mv / 0.12207) 
         adc_trigger = adc_baseline - adc_trg_drop
@@ -295,7 +296,8 @@ class ConfigTab(QWidget):
         base_pct = self.spin_base_pct.value() / 100.0
         trg_mv = self.spin_trg_mv.value()
         
-        calc_offset = str(int(base_pct * 65535))
+        # 🚨 [물리적 하드웨어 특성 롤백 적용]
+        calc_offset = str(int((1.0 - base_pct) * 65535))
         calc_trg = str(int((base_pct * 16383) - (trg_mv / 0.12207)))
         
         active_hardware_mask = self.rec_mask_val | self.trg_mask_val
