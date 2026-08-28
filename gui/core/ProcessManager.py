@@ -9,7 +9,7 @@ class ProcessManager(QThread):
     
     temp_signal = pyqtSignal(float)
     led_signal = pyqtSignal(dict)
-    fatal_signal = pyqtSignal(str) # Soft-kill 이벤트 감지 시그널
+    fatal_signal = pyqtSignal(str) 
 
     def __init__(self, cmd, cwd=None):
         super().__init__()
@@ -45,12 +45,17 @@ class ProcessManager(QThread):
                     
                     if "[FATAL] OVER_TEMP_SOFT_KILL" in clean_line:
                         self.fatal_signal.emit("OVER_TEMP_SOFT_KILL")
-                    elif "[LIVE DAQ]" in clean_line:
-                        self._parse_and_emit_stats(clean_line)
-                    elif "[STATUS] TEMP:" in clean_line:
+                        
+                    # =========================================================================
+                    # [핵심 방어] 스트림 문자열 엉킴 방지 
+                    # elif 대신 독립된 if문을 사용하여, 한 줄에 DAQ, TEMP, LED가 모두 엉겨있어도 
+                    # 빠짐없이 캐치하여 UI로 발송합니다.
+                    # =========================================================================
+                    if "[STATUS] TEMP:" in clean_line:
                         m = self.re_temp.search(clean_line)
                         if m: self.temp_signal.emit(float(m.group(1)))
-                    elif "[STATUS] LED:" in clean_line:
+                        
+                    if "[STATUS] LED:" in clean_line:
                         m = self.re_led.search(clean_line)
                         if m:
                             self.led_signal.emit({
@@ -61,7 +66,12 @@ class ProcessManager(QThread):
                                 'DRDY': int(m.group(5)),
                                 'BUSY': int(m.group(6))
                             })
-                    else:
+                            
+                    if "[LIVE DAQ]" in clean_line:
+                        self._parse_and_emit_stats(clean_line)
+                    
+                    # 일반 로그 출력 (충돌된 지저분한 상태 로그는 터미널에 보이지 않도록 필터링)
+                    if "[LIVE DAQ]" not in clean_line and "[STATUS]" not in clean_line and "[FATAL]" not in clean_line:
                         self.log_signal.emit(clean_line)
             
             self.process.wait()
@@ -74,30 +84,39 @@ class ProcessManager(QThread):
 
     def _parse_and_emit_stats(self, line):
         """
-        [핵심 수정] 백엔드에서 쏟아지는 '[LIVE DAQ]' 스트림을 파싱하여 UI 대시보드로 전달.
-        과거 코드에서 버려지던 Rate와 Drops 항목에 대한 낚아채기(Parsing) 로직을 완벽 복원.
+        [정규식 기반 핀셋 추출] 
+        문자열 스플릿의 취약점을 폐기하고 Regex를 도입하여,
+        뒤에 어떤 쓰레기 문자가 섞여 들어와도 오직 '숫자'만 안전하게 추출합니다.
         """
         try:
             stats = {}
-            parts = line.split("|")
-            for part in parts:
-                if "Live:" in part:
-                    stats['live_time'] = part.split("Live:")[1].strip()
-                elif "DT:" in part:
-                    stats['dead_time'] = part.split("DT:")[1].strip()
-                elif "Events:" in part:
-                    stats['events'] = part.split("Events:")[1].strip()
-                elif "Speed:" in part:
-                    stats['speed'] = part.split("Speed:")[1].strip()
-                # =========================================================
-                # [버그 픽스] 누락되었던 Rate 및 Drops 파싱 로직 추가
-                # =========================================================
-                elif "Rate:" in part:
-                    stats['rate'] = part.split("Rate:")[1].strip()
-                elif "Drops:" in part:
-                    stats['drops'] = part.split("Drops:")[1].strip()
-                # =========================================================
-            self.stat_signal.emit(stats)
+            if "Live:" in line:
+                m = re.search(r"Live:\s*([\d\.]+)", line)
+                if m: stats['live_time'] = f"{m.group(1)} s"
+                
+            if "DT:" in line:
+                m = re.search(r"DT:\s*([\d\.]+)", line)
+                if m: stats['dead_time'] = f"{m.group(1)} %"
+                
+            if "Events:" in line:
+                m = re.search(r"Events:\s*(\d+)", line)
+                if m: stats['events'] = m.group(1)
+                
+            if "Rate:" in line:
+                m = re.search(r"Rate:\s*([\d\.]+)", line)
+                if m: stats['rate'] = f"{m.group(1)} Hz"
+                
+            if "Speed:" in line:
+                m = re.search(r"Speed:\s*([\d\.]+)", line)
+                if m: stats['speed'] = f"{m.group(1)} MB/s"
+                
+            if "Drops:" in line:
+                # 텍스트 엉김의 주범이었던 Drops 값을 정규식으로 안전하게 추출 ('0[STATUS] LED...' -> '0')
+                m = re.search(r"Drops:\s*(\d+)", line)
+                if m: stats['drops'] = m.group(1)
+
+            if stats:
+                self.stat_signal.emit(stats)
         except Exception:
             pass
 

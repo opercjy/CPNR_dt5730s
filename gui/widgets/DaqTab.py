@@ -11,9 +11,6 @@ from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
 from core.ProcessManager import ProcessManager
 from core.DatabaseManager import DatabaseManager
 
-# =========================================================================
-# [물리적 방향성(Negative Pulse)이 적용된 1D 스캔 비주얼라이저]
-# =========================================================================
 class ADCScanVisualizer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -247,13 +244,9 @@ class DaqTab(QWidget):
         dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 2); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 3)
         dash_layout.addWidget(QLabel("Dead Time:", styleSheet=lbl_style), 1, 4); self.val_dead_time = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_dead_time, 1, 5)
         
-        # =========================================================================
-        # [신규 추가] 레이아웃 우측 하단에 Trig Rate 블록 추가
-        # =========================================================================
         dash_layout.addWidget(QLabel("Trig Rate:", styleSheet=lbl_style), 1, 6)
         self.val_rate = QLabel("0.0 Hz", styleSheet=self.val_style)
         dash_layout.addWidget(self.val_rate, 1, 7)
-        # =========================================================================
         
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
@@ -368,15 +361,10 @@ class DaqTab(QWidget):
         self.val_events.setText(stats.get('events', stats.get('Events', '0')))
         self.val_speed.setText(stats.get('speed', stats.get('Speed', '0.00 MB/s'))) 
         
-        # =========================================================================
-        # [신규 추가] Rate 업데이트 파싱 강화
-        # 파이썬 파서가 넘겨줄 때 'Rate' 혹은 'rate' 키워드를 모두 추적하여 UI에 반영
-        # =========================================================================
         rate_val = stats.get('rate', stats.get('Rate', '0.0 Hz'))
         if "Hz" not in rate_val and rate_val != "0.0": 
             rate_val += " Hz"
         self.val_rate.setText(rate_val)
-        # =========================================================================
         
         dt_str = stats.get('dead_time', stats.get('DT', '0.000 %'))
         self.val_dead_time.setText(dt_str)
@@ -386,7 +374,13 @@ class DaqTab(QWidget):
         except ValueError:
             pass
 
-        drops = int(stats.get('drops', stats.get('Drops', '0')))
+        # =========================================================================
+        # [방어 코드 2중화] 파서에서 누출된 쓰레기 문자가 있어도 안전하게 정수로 파싱
+        # =========================================================================
+        raw_drops = str(stats.get('drops', stats.get('Drops', '0')))
+        match = re.search(r'\d+', raw_drops)
+        drops = int(match.group()) if match else 0
+        
         self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
         self.val_drops.setText(str(drops))
 
