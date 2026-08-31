@@ -166,14 +166,8 @@ make -j4
 
 ---
 
-## 👨‍🔬 Author & Acknowledgment
+## 👨‍🔬 Acknowledgment
 
-* **Ji-young Choi (최지영)** 
-  * Nuclear and Particle Physicist
-  * Department of Physics, Center for Precision Neutrino Research (CPNR), Chonnam National University
-
-> **🙏 Funding & Open Source Statement**
-> 
 > 본 연구 및 소프트웨어 개발은 **국민의 소중한 세금으로 조성된 국가 연구개발(R&D) 재원**을 바탕으로 수행되었습니다. 
 > 
 > 기초 과학 연구를 위해 기꺼이 세금을 부담해 주신 대한민국 국민 여러분께 깊은 감사를 드립니다. 그 헌신에 조금이나마 보답하고 공공의 이익에 기여하고자, 본 프로젝트에서 개발된 데이터 획득(DAQ) 소스코드와 제1원리 기반의 분석 방법론은 상업적 독점이나 파편화를 철저히 배제하고 오픈소스 원칙에 따라 투명하게 전체 공개됩니다. 
