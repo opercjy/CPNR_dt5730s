@@ -1,50 +1,142 @@
-import struct
+import math
+import os
+import time
+
 import numpy as np
 import pyqtgraph as pg
 import zmq
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QComboBox, 
-                             QLabel, QPushButton, QSpinBox, QProgressBar, 
-                             QMessageBox, QCheckBox)
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton, QSpinBox, QProgressBar, QMessageBox, QCheckBox
+from PyQt6.QtCore import QTimer, pyqtSlot
 from collections import deque
 
-# CAEN Event Header: ExtTTT(Q), EvtID(I), RecLen(I), Mask(H), Pattern(H), BoardEventCounter(I)
-HEADER_FORMAT = "=QIIHHI"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+from core.monitor_stream import (
+    EventSequenceTracker,
+    MAX_MONITOR_FRAME_BYTES,
+    MonitorConfigError,
+    RuntimeConfigReference,
+    analyze_monitor_waveform,
+    drain_latest_frames,
+    load_runtime_polarity,
+)
+
+
+DEFAULT_POLL_MESSAGE_BUDGET = 32
+DEFAULT_POLL_TIME_BUDGET_MS = 5.0
+MAX_POLL_MESSAGE_BUDGET = 256
+MAX_POLL_TIME_BUDGET_MS = 50.0
+POLARITY_REFRESH_NS = 1_000_000_000
+HISTOGRAM_REFRESH_NS = 100_000_000
+MONITOR_RCVHWM_MESSAGES = 32
+DEFAULT_HISTORY_FRAMES = 100_000
+MAX_NUMERIC_HISTORY_FRAMES = 2_147_483_647
 
 class MonitorTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        config_path_provider=None,
+        monitor_socket=None,
+        monitor_context=None,
+        poll_message_budget=DEFAULT_POLL_MESSAGE_BUDGET,
+        poll_time_budget_ms=DEFAULT_POLL_TIME_BUDGET_MS,
+        clock_ns=time.monotonic_ns,
+    ):
         super().__init__(parent)
-        self.current_mask = -1  
-        self.curves_wave = {}   
-        self.curves_qlong = {}  
-        self.q_long_hists = {}  
-        self.ch_cbs = {} # 채널별 체크박스 객체 저장소
-        
+        if (
+            isinstance(poll_message_budget, bool)
+            or not isinstance(poll_message_budget, int)
+            or not 1 <= poll_message_budget <= MAX_POLL_MESSAGE_BUDGET
+        ):
+            raise ValueError(
+                f"poll_message_budget must be 1..{MAX_POLL_MESSAGE_BUDGET}"
+            )
+        if (
+            isinstance(poll_time_budget_ms, bool)
+            or not isinstance(poll_time_budget_ms, (int, float))
+            or not math.isfinite(float(poll_time_budget_ms))
+            or not 0.1 <= float(poll_time_budget_ms) <= MAX_POLL_TIME_BUDGET_MS
+        ):
+            raise ValueError(
+                "poll_time_budget_ms must be finite and in the 0.1..50 ms range"
+            )
+        if not callable(clock_ns):
+            raise TypeError("clock_ns must be callable")
+
+        self.current_mask = -1
+        self.curves_wave = {}
+        self.curves_qlong = {}
+        self.q_long_hists = {}
+        self.config_path_provider = config_path_provider
+        self.poll_message_budget = poll_message_budget
+        self.poll_time_budget_ns = int(float(poll_time_budget_ms) * 1_000_000)
+        self._clock_ns = clock_ns
+        self._cleaned = False
+        self._owns_zmq_context = False
+        self._active_polarity = None
+        self._polarity_source = None
+        self._polarity_identity = None
+        self._polarity_sha256 = None
+        self._polarity_authenticated = False
+        self._polarity_provider_key = None
+        self._polarity_error = "active runtime config has not been resolved"
+        self._next_polarity_refresh_ns = 0
+        self._next_histogram_refresh_ns = 0
+        self.sequence_tracker = EventSequenceTracker()
+        self.total_received_frames = 0
+        self.total_valid_frames = 0
+        self.total_malformed_frames = 0
+        self.total_rendered_frames = 0
+        self.total_decimated_frames = 0
+        self.budget_limited_ticks = 0
+        self.socket_errors = 0
+        self.last_stream_error = None
+        self._has_rendered_data = False
+
         self.colors = [
             '#0d6efd', '#198754', '#dc3545', '#fd7e14', 
             '#6f42c1', '#0dcaf0', '#d63384', '#6c757d'
         ]
-        
-        self.warning_latched = False 
-        
-        self.setup_zmq()
-        self.setup_ui()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.poll_zmq)
-        self.timer.start(33) 
 
-    def setup_zmq(self):
-        self.ctx = zmq.Context()
-        self.sock = self.ctx.socket(zmq.SUB)
-        self.sock.setsockopt(zmq.RCVHWM, 2000) 
-        self.sock.connect("tcp://127.0.0.1:5555")
-        self.sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.warning_latched = False
+
+        self.setup_zmq(monitor_socket, monitor_context)
+        self.setup_ui()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll_zmq)
+        self.timer.start(33)
+
+    def setup_zmq(self, monitor_socket=None, monitor_context=None):
+        if monitor_socket is not None:
+            self.ctx = monitor_context
+            self.sock = monitor_socket
+            return
+
+        context = monitor_context or zmq.Context(io_threads=1)
+        owns_context = monitor_context is None
+        sock = context.socket(zmq.SUB)
+        try:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVHWM, MONITOR_RCVHWM_MESSAGES)
+            sock.setsockopt(zmq.MAXMSGSIZE, MAX_MONITOR_FRAME_BYTES)
+            # Keep at most the latest single-part event when libzmq supports
+            # conflation.  The explicit poll budgets below remain mandatory.
+            if hasattr(zmq, "CONFLATE"):
+                sock.setsockopt(zmq.CONFLATE, 1)
+            sock.setsockopt_string(zmq.SUBSCRIBE, "")
+            sock.connect("tcp://127.0.0.1:5555")
+        except Exception:
+            sock.close(linger=0)
+            if owns_context:
+                context.term()
+            raise
+        self.ctx = context
+        self.sock = sock
+        self._owns_zmq_context = owns_context
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
-        # 1. 상단 컨트롤 패널
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(QLabel("<b>Display Engine:</b>"))
         
@@ -55,18 +147,32 @@ class MonitorTab(QWidget):
 
         ctrl_layout.addWidget(QLabel("  |  <b>Analysis Mode:</b>"))
         self.cb_spec_mode = QComboBox()
-        self.cb_spec_mode.addItems(["📊 Pulse Charge (Integral Area)", "📈 Pulse Height (Amplitude)"])
+        self.cb_spec_mode.addItems(["📊 Pulse Charge (Signed Integral)", "📈 Pulse Height (Amplitude)"])
+        self.cb_spec_mode.setToolTip(
+            "Charge is the signed, baseline-subtracted sum over the full "
+            "waveform, oriented so the configured pulse polarity is positive."
+        )
         self.cb_spec_mode.currentIndexChanged.connect(self.toggle_spec_mode)
         ctrl_layout.addWidget(self.cb_spec_mode)
 
-        ctrl_layout.addWidget(QLabel("  |  <b>Spectrum History:</b>"))
+        ctrl_layout.addWidget(QLabel("  |  <b>GUI Sample History:</b>"))
         self.spin_history = QSpinBox()
-        self.spin_history.setRange(100, 100000)
-        self.spin_history.setSingleStep(500)
-        self.spin_history.setValue(2000)
-        self.spin_history.setSuffix(" Evts")
+        self.spin_history.setRange(100, MAX_NUMERIC_HISTORY_FRAMES)
+        self.spin_history.setSingleStep(10_000)
+        self.spin_history.setValue(DEFAULT_HISTORY_FRAMES)
+        self.spin_history.setSuffix(" frames")
+        self.spin_history.setAccelerated(True)
         self.spin_history.valueChanged.connect(self.update_history_size)
         ctrl_layout.addWidget(self.spin_history)
+
+        self.chk_unlimited_history = QCheckBox("Unlimited")
+        self.chk_unlimited_history.setToolTip(
+            "Keep every rendered monitor sample without eviction. Memory "
+            "usage and histogram refresh cost will continue to grow until "
+            "Clear All or application exit."
+        )
+        self.chk_unlimited_history.toggled.connect(self.update_history_size)
+        ctrl_layout.addWidget(self.chk_unlimited_history)
 
         self.btn_clear = QPushButton("🗑️ Clear All")
         self.btn_clear.setStyleSheet("font-weight: bold; padding: 4px 15px; margin-left: 10px;")
@@ -84,27 +190,37 @@ class MonitorTab(QWidget):
         ctrl_layout.addStretch() 
         layout.addLayout(ctrl_layout)
 
-        # =========================================================================
-        # [신규 추가] 채널별 렌더링 가시성(Visibility) 토글 체크박스
-        # =========================================================================
-        vis_layout = QHBoxLayout()
-        vis_layout.addWidget(QLabel("<b>Channel Visibility:</b>"))
-        
-        for i in range(8):
-            cb = QCheckBox(f"CH {i}")
-            cb.setChecked(True)
-            cb.setEnabled(False) # 데이터가 들어와서 활성화되기 전까지 잠금
-            # 채널 색상과 동일하게 라벨 색상 부여
-            cb.setStyleSheet(f"QCheckBox {{ color: {self.colors[i]}; font-weight: bold; margin-right: 10px; }}")
-            cb.stateChanged.connect(lambda state, ch=i: self.toggle_channel_visibility(ch, state))
-            vis_layout.addWidget(cb)
-            self.ch_cbs[i] = cb
-            
-        vis_layout.addStretch()
-        layout.addLayout(vis_layout)
-        # =========================================================================
+        monitor_status_layout = QHBoxLayout()
+        self.lbl_preview_status = QLabel()
+        self.lbl_preview_status.setToolTip(
+            "This is the latest lossy Live Monitor preview. It confirms that "
+            "the GUI observed a valid monitor frame, but it does not prove "
+            "raw-file completeness or DAQ losslessness."
+        )
+        self._set_preview_status(
+            "EMPTY — waiting for a valid monitor frame", "#6c757d"
+        )
+        monitor_status_layout.addWidget(self.lbl_preview_status)
+        monitor_status_layout.addSpacing(20)
+        self.lbl_polarity = QLabel(
+            "DSP polarity: unavailable (spectrum paused)"
+        )
+        self.lbl_polarity.setToolTip(
+            "Charge/height DSP is enabled only when TriggerPolarity can be "
+            "read from the active runtime config."
+        )
+        monitor_status_layout.addWidget(self.lbl_polarity)
+        monitor_status_layout.addSpacing(20)
+        self.lbl_stream_stats = QLabel()
+        self.lbl_stream_stats.setWordWrap(True)
+        self.lbl_stream_stats.setToolTip(
+            "Subscriber-observed EventID gaps are gaps visible to this GUI "
+            "SUB socket. They are not the DAQ hardware/publisher loss count."
+        )
+        monitor_status_layout.addWidget(self.lbl_stream_stats, 1)
+        layout.addLayout(monitor_status_layout)
+        self._update_stream_status()
 
-        # 2. PyQtGraph 캔버스 설정
         pg.setConfigOptions(antialias=True, background='#f8f9fa', foreground='#212529')
         self.glw = pg.GraphicsLayoutWidget()
         layout.addWidget(self.glw)
@@ -115,30 +231,34 @@ class MonitorTab(QWidget):
         self.plot_wave.addLegend(offset=(10, 10))
         self.glw.nextRow()
 
-        self.plot_qlong = self.glw.addPlot(title="Real-time Computed Charge Spectrum")
+        self.plot_qlong = self.glw.addPlot(
+            title="Decimated Live-Monitor Signed Charge Spectrum"
+        )
         self.plot_qlong.setLogMode(y=True)
-        self.plot_qlong.setLabel('bottom', "Integrated Charge (ADC Bins)")
+        self.plot_qlong.setLabel('bottom', "Signed Integrated Charge (ADC·sample)")
         self.plot_qlong.setLabel('left', "Counts (Log)")
         self.plot_qlong.addLegend(offset=(10, 10))
 
-    @pyqtSlot(int, int)
-    def toggle_channel_visibility(self, ch, state):
-        """체크박스 상태에 따라 파형과 스펙트럼 곡선을 숨기거나 표시합니다."""
-        is_visible = (state == Qt.CheckState.Checked.value)
-        if ch in self.curves_wave:
-            self.curves_wave[ch].setVisible(is_visible)
-        if ch in self.curves_qlong:
-            self.curves_qlong[ch].setVisible(is_visible)
-
     @pyqtSlot(int)
     def toggle_spec_mode(self, idx):
+        """Update the monitor-only DSP view and discard mixed-mode history."""
         if idx == 0:
-            self.plot_qlong.setTitle("Real-time Computed Charge Spectrum")
-            self.plot_qlong.setLabel('bottom', "Integrated Charge (ADC Bins)")
+            self.plot_qlong.setTitle(
+                "Decimated Live-Monitor Signed Charge Spectrum"
+            )
+            self.plot_qlong.setLabel(
+                'bottom', "Signed Integrated Charge (ADC·sample)"
+            )
         else:
-            self.plot_qlong.setTitle("Real-time Pulse Height Spectrum")
+            self.plot_qlong.setTitle(
+                "Decimated Live-Monitor Pulse Height Spectrum"
+            )
             self.plot_qlong.setLabel('bottom', "Pulse Height Amplitude (ADC Bins)")
-        self.clear_data()
+        self._clear_plot_data(reset_stream_stats=False)
+        self._set_preview_status(
+            "EMPTY — analysis mode changed; waiting for a new frame",
+            "#6c757d",
+        )
 
     @pyqtSlot(float)
     def update_temperature(self, temp: float):
@@ -157,11 +277,24 @@ class MonitorTab(QWidget):
             if temp < 75.0:
                 self.warning_latched = False
 
-    def update_history_size(self):
-        new_size = self.spin_history.value()
+    def update_history_size(self, _value=None):
+        new_size = self._history_maxlen()
+        self.spin_history.setEnabled(new_size is not None)
         for ch in self.q_long_hists:
-            current_data = list(self.q_long_hists[ch])
-            self.q_long_hists[ch] = deque(current_data[-new_size:], maxlen=new_size)
+            self.q_long_hists[ch] = deque(
+                self.q_long_hists[ch], maxlen=new_size
+            )
+
+    def _history_maxlen(self):
+        if self.chk_unlimited_history.isChecked():
+            return None
+        return self.spin_history.value()
+
+    def _set_preview_status(self, text, color):
+        self.lbl_preview_status.setText(f"Preview: {text}")
+        self.lbl_preview_status.setStyleSheet(
+            f"color: {color}; font-weight: bold;"
+        )
 
     def rebuild_plots(self, mask):
         self.plot_wave.clear()
@@ -173,39 +306,56 @@ class MonitorTab(QWidget):
         self.curves_qlong.clear()
         self.q_long_hists.clear()
         
-        # 모든 체크박스 초기화
-        for i in range(8):
-            self.ch_cbs[i].setEnabled(False)
-            
         active_channels = [i for i in range(8) if (mask >> i) & 1]
         
         for ch in active_channels:
-            # 해당 채널의 체크박스 활성화
-            self.ch_cbs[ch].setEnabled(True)
-            
             color = self.colors[ch % len(self.colors)]
+            
             pen = pg.mkPen(color, width=1.5)
             self.curves_wave[ch] = self.plot_wave.plot(name=f"CH {ch}", pen=pen)
             
             brush = pg.mkColor(color)
             brush.setAlpha(100)
             
-            self.curves_qlong[ch] = self.plot_qlong.plot(name=f"CH {ch}", stepMode=True, fillLevel=0.1, brush=brush, pen=color)
-            self.q_long_hists[ch] = deque(maxlen=self.spin_history.value())
+            self.curves_qlong[ch] = self.plot_qlong.plot(
+                name=f"CH {ch}",
+                stepMode="center",
+                fillLevel=0.1,
+                brush=brush,
+                pen=color,
+            )
             
-            # 체크박스 상태에 따라 가시성 즉각 적용
-            self.toggle_channel_visibility(ch, self.ch_cbs[ch].checkState().value)
+            self.q_long_hists[ch] = deque(maxlen=self._history_maxlen())
 
     def toggle_monitor(self, idx):
         if idx == 0:
+            # A deliberate OFF interval is a new observation window.  Do not
+            # report the intentionally unobserved interval as a DAQ loss.
+            self.sequence_tracker.start_new_observation_window()
             self.timer.start(33)
+            if self._has_rendered_data:
+                self._set_preview_status(
+                    "WAITING — monitor enabled; previous preview retained",
+                    "#997404",
+                )
+            else:
+                self._set_preview_status(
+                    "WAITING — monitor enabled; awaiting a valid frame",
+                    "#6c757d",
+                )
         else:
             self.timer.stop()
-            while True:
-                try: self.sock.recv(flags=zmq.NOBLOCK)
-                except zmq.Again: break
+            self.sequence_tracker.start_new_observation_window()
+            self._set_preview_status(
+                "PAUSED — monitor disabled; displayed preview is frozen",
+                "#997404",
+            )
 
     def clear_data(self):
+        self._clear_plot_data(reset_stream_stats=True)
+        self._set_preview_status("EMPTY — cleared by operator", "#6c757d")
+
+    def _clear_plot_data(self, *, reset_stream_stats):
         for ch in self.q_long_hists:
             self.q_long_hists[ch].clear()
             if ch in self.curves_wave:
@@ -213,91 +363,280 @@ class MonitorTab(QWidget):
             if ch in self.curves_qlong:
                 self.curves_qlong[ch].setData(x=np.array([-0.5, 0.5]), y=np.array([0.1]))
 
+        self._has_rendered_data = False
+
+        if reset_stream_stats:
+            self.sequence_tracker.reset()
+            self.total_received_frames = 0
+            self.total_valid_frames = 0
+            self.total_malformed_frames = 0
+            self.total_rendered_frames = 0
+            self.total_decimated_frames = 0
+            self.budget_limited_ticks = 0
+            self.socket_errors = 0
+            self.last_stream_error = None
+            self._update_stream_status()
+
+    def _refresh_runtime_polarity(self, now_ns):
+        if not callable(self.config_path_provider):
+            state_changed = (
+                self._active_polarity is not None
+                or self._polarity_provider_key is not None
+            )
+            self._active_polarity = None
+            self._polarity_source = None
+            self._polarity_identity = None
+            self._polarity_sha256 = None
+            self._polarity_authenticated = False
+            self._polarity_provider_key = None
+            self._polarity_error = "active runtime config path is unavailable"
+            if state_changed:
+                self._start_new_runtime_observation()
+            self._update_polarity_status()
+            return
+
+        try:
+            config_reference = self.config_path_provider()
+            if not config_reference:
+                raise MonitorConfigError(
+                    "active runtime config path is unavailable"
+                )
+            if isinstance(config_reference, RuntimeConfigReference):
+                config_path = config_reference.path
+                expected_sha256 = config_reference.expected_sha256
+            else:
+                config_path = config_reference
+                expected_sha256 = None
+            provider_key = os.fspath(config_path)
+            if not isinstance(provider_key, str):
+                raise MonitorConfigError(
+                    "active runtime config path is not textual"
+                )
+            provider_key = (provider_key, expected_sha256)
+        except (MonitorConfigError, OSError, TypeError, ValueError) as exc:
+            state_changed = (
+                self._active_polarity is not None
+                or self._polarity_provider_key is not None
+            )
+            self._active_polarity = None
+            self._polarity_source = None
+            self._polarity_identity = None
+            self._polarity_sha256 = None
+            self._polarity_authenticated = False
+            self._polarity_provider_key = None
+            self._polarity_error = str(exc)
+            self._next_polarity_refresh_ns = now_ns + POLARITY_REFRESH_NS
+            if state_changed:
+                self._start_new_runtime_observation()
+            self._update_polarity_status()
+            return
+
+        # Check the provider on every tick (cheap) so a new run/config cannot
+        # use the previous run's polarity for up to one refresh interval.
+        provider_changed = provider_key != self._polarity_provider_key
+        if not provider_changed and now_ns < self._next_polarity_refresh_ns:
+            return
+        self._next_polarity_refresh_ns = now_ns + POLARITY_REFRESH_NS
+        previous_polarity = self._active_polarity
+        if provider_changed:
+            self._start_new_runtime_observation()
+
+        try:
+            selection = load_runtime_polarity(
+                config_path, expected_sha256=expected_sha256
+            )
+        except (MonitorConfigError, OSError, TypeError, ValueError) as exc:
+            # Fail closed: a stale previously parsed polarity is not safe for
+            # a newly selected run. Waveforms remain visible, spectra pause.
+            self._active_polarity = None
+            self._polarity_source = None
+            self._polarity_identity = None
+            self._polarity_sha256 = None
+            self._polarity_authenticated = False
+            self._polarity_provider_key = provider_key
+            self._polarity_error = str(exc)
+            if not provider_changed and previous_polarity is not None:
+                self._start_new_runtime_observation()
+        else:
+            self._active_polarity = selection.polarity
+            self._polarity_source = selection.source_path
+            self._polarity_identity = selection.identity
+            self._polarity_sha256 = selection.sha256
+            self._polarity_authenticated = selection.authenticated
+            self._polarity_provider_key = provider_key
+            self._polarity_error = None
+            if (
+                not provider_changed
+                and previous_polarity is not None
+                and previous_polarity != selection.polarity
+            ):
+                self._start_new_runtime_observation()
+        self._update_polarity_status()
+
+    def _start_new_runtime_observation(self):
+        self.sequence_tracker.start_new_observation_window()
+        self._clear_plot_data(reset_stream_stats=False)
+        self._set_preview_status(
+            "LIVE/WAITING — new run detected; awaiting a valid frame",
+            "#0d6efd",
+        )
+
+    @pyqtSlot(int)
+    def hold_last_preview(self, _returncode):
+        if self._has_rendered_data:
+            self._set_preview_status(
+                "HELD — DAQ stopped; last monitor preview retained",
+                "#997404",
+            )
+        else:
+            self._set_preview_status(
+                "EMPTY — DAQ stopped; no valid monitor frame received",
+                "#b02a37",
+            )
+
+    def _update_polarity_status(self):
+        if self._active_polarity is None:
+            self.lbl_polarity.setText(
+                "DSP polarity: unavailable (spectrum paused)"
+            )
+            self.lbl_polarity.setStyleSheet("color: #b02a37; font-weight: bold;")
+            self.lbl_polarity.setToolTip(
+                "Monitor DSP is paused because the active runtime config "
+                f"cannot be trusted: {self._polarity_error}"
+            )
+            return
+
+        source_name = self._polarity_source.rsplit("/", 1)[-1]
+        verification = "SHA-256 verified" if self._polarity_authenticated else "selected file"
+        self.lbl_polarity.setText(
+            f"DSP polarity: {self._active_polarity} "
+            f"({source_name}, {verification})"
+        )
+        self.lbl_polarity.setStyleSheet("color: #146c43; font-weight: bold;")
+        self.lbl_polarity.setToolTip(
+            f"Polarity read from runtime config: {self._polarity_source}\n"
+            f"SHA-256: {self._polarity_sha256}\n"
+            f"Run-context authenticated: {self._polarity_authenticated}"
+        )
+
+    def _update_stream_status(self):
+        tracker = self.sequence_tracker
+        self.lbl_stream_stats.setText(
+            "Frames recv/render/GUI-decimated/malformed: "
+            f"{self.total_received_frames}/{self.total_rendered_frames}/"
+            f"{self.total_decimated_frames}/{self.total_malformed_frames}  |  "
+            "Subscriber-observed EventID gaps (not DAQ loss): "
+            f"{tracker.observed_subscriber_gaps}  |  "
+            f"duplicates/discontinuities: {tracker.duplicate_event_ids}/"
+            f"{tracker.sequence_discontinuities}  |  "
+            f"budget-limited ticks: {self.budget_limited_ticks}"
+        )
+        if self.last_stream_error:
+            self.lbl_stream_stats.setToolTip(
+                "Subscriber-observed EventID gaps are not the DAQ loss count. "
+                f"Last monitor error: {self.last_stream_error}"
+            )
+        else:
+            self.lbl_stream_stats.setToolTip(
+                "Subscriber-observed EventID gaps can be caused by PUB/SUB "
+                "conflation, HWM, transport, or a paused/decimated GUI. They "
+                "do not measure hardware or raw-file DAQ loss."
+            )
+
     def poll_zmq(self):
-        latest_msg = None
-        while True:
-            try:
-                msg = self.sock.recv(flags=zmq.NOBLOCK)
-                latest_msg = msg
-                
-                header = struct.unpack(HEADER_FORMAT, msg[:HEADER_SIZE])
-                record_len = int(header[2])
-                mask = int(header[3])
-                
-                if mask != self.current_mask:
-                    self.current_mask = mask
-                    self.rebuild_plots(mask)
-                    self.clear_data()
-                    
-                active_channels = [i for i in range(8) if (mask >> i) & 1]
-                spec_mode = self.cb_spec_mode.currentIndex()
-                
-                for idx, ch in enumerate(active_channels):
-                    # 가시성 체크박스가 꺼져 있다면 스펙트럼 적분 연산도 생략하여 CPU 절약
-                    if not self.ch_cbs[ch].isChecked():
-                        continue
+        if self._cleaned or self.sock is None:
+            return
 
-                    offset = HEADER_SIZE + (idx * record_len * 2)
-                    wave_bytes = msg[offset : offset + (record_len * 2)]
-                    
-                    if wave_bytes:
-                        wave_arr = np.frombuffer(wave_bytes, dtype=np.uint16)
-                        if len(wave_arr) > 20: 
-                            min_idx = int(np.argmin(wave_arr))
-                            
-                            if min_idx > 10:
-                                baseline_end = min(record_len // 4, min_idx - 5)
-                            else:
-                                baseline_end = 10
-                                
-                            baseline_end = max(5, baseline_end) 
-                            baseline = np.mean(wave_arr[:baseline_end])
+        now_ns = self._clock_ns()
+        self._refresh_runtime_polarity(now_ns)
+        try:
+            batch = drain_latest_frames(
+                lambda: self.sock.recv(flags=zmq.NOBLOCK),
+                self.sequence_tracker,
+                max_messages=self.poll_message_budget,
+                time_budget_ns=self.poll_time_budget_ns,
+                clock_ns=self._clock_ns,
+                empty_exceptions=(zmq.Again,),
+            )
+        except zmq.ZMQError as exc:
+            self.socket_errors += 1
+            self.last_stream_error = f"ZeroMQ receive error: {exc}"
+            self._update_stream_status()
+            return
 
-                            val = 0.0
-                            if spec_mode == 0:
-                                pulse_region = wave_arr[wave_arr < baseline]
-                                val = np.sum(baseline - pulse_region)
-                            else:
-                                val = baseline - wave_arr[min_idx]
+        self.total_received_frames += batch.received_frames
+        self.total_valid_frames += batch.valid_frames
+        self.total_malformed_frames += batch.malformed_frames
+        self.total_decimated_frames += batch.decimated_valid_frames
+        if batch.stop_reason in ("message_budget", "time_budget"):
+            self.budget_limited_ticks += 1
+        if batch.last_decode_error:
+            self.last_stream_error = batch.last_decode_error
 
-                            if val > 0: 
-                                self.q_long_hists[ch].append(val)
-            except zmq.Again: 
-                break
+        if batch.latest_frame is not None:
+            self._render_frame(batch.latest_frame, self._clock_ns())
+            self.total_rendered_frames += 1
+        self._update_stream_status()
 
-        if latest_msg:
-            header = struct.unpack(HEADER_FORMAT, latest_msg[:HEADER_SIZE])
-            record_len = int(header[2])
-            mask = int(header[3])
-            active_channels = [i for i in range(8) if (mask >> i) & 1]
-            
-            for idx, ch in enumerate(active_channels):
-                if not self.ch_cbs[ch].isChecked():
-                    continue
+    def _render_frame(self, frame, now_ns):
+        mask = frame.header.channel_mask
+        if mask != self.current_mask:
+            self.current_mask = mask
+            self.rebuild_plots(mask)
 
-                if ch in self.curves_wave:
-                    offset = HEADER_SIZE + (idx * record_len * 2)
-                    wave_bytes = latest_msg[offset : offset + (record_len * 2)]
-                    if wave_bytes:
-                        wave_arr = np.frombuffer(wave_bytes, dtype=np.uint16)
-                        self.curves_wave[ch].setData(wave_arr)
-                        
-            for ch in self.curves_qlong:
-                if not self.ch_cbs[ch].isChecked():
-                    continue
+        spec_mode = self.cb_spec_mode.currentIndex()
+        for channel, waveform in frame.waveforms.items():
+            curve = self.curves_wave.get(channel)
+            if curve is not None:
+                curve.setData(waveform)
 
-                hist_data = self.q_long_hists[ch]
-                if len(hist_data) > 5:
-                    data_min, data_max = min(hist_data), max(hist_data)
-                    if data_min == data_max: 
-                        continue 
-                        
-                    y, x_edges = np.histogram(hist_data, bins=150)
-                    y = np.where(y == 0, 0.1, y) 
-                    
-                    self.curves_qlong[ch].setData(x=x_edges, y=y)
+            if self._active_polarity is None:
+                continue
+            result = analyze_monitor_waveform(
+                waveform, self._active_polarity
+            )
+            value = result.charge if spec_mode == 0 else result.pulse_height
+            if spec_mode == 0 or value > 0.0:
+                self.q_long_hists[channel].append(value)
+
+        self._has_rendered_data = True
+        self._set_preview_status(
+            f"LIVE — latest EventID {frame.header.event_id}", "#146c43"
+        )
+
+        if now_ns < self._next_histogram_refresh_ns:
+            return
+        self._next_histogram_refresh_ns = now_ns + HISTOGRAM_REFRESH_NS
+        for channel, curve in self.curves_qlong.items():
+            hist_data = self.q_long_hists[channel]
+            if len(hist_data) <= 5:
+                continue
+            y, x_edges = np.histogram(hist_data, bins=150)
+            y = np.where(y == 0, 0.1, y)
+            curve.setData(x=x_edges, y=y)
 
     def cleanup(self):
-        if self.timer.isActive(): self.timer.stop()
-        self.sock.close()
-        self.ctx.term()
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if self.timer.isActive():
+            self.timer.stop()
+
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            try:
+                sock.close(linger=0)
+            except TypeError:
+                # Lightweight injected test sockets may expose close() only.
+                sock.close()
+            except zmq.ZMQError:
+                pass
+
+        context = self.ctx
+        self.ctx = None
+        if self._owns_zmq_context and context is not None:
+            try:
+                context.term()
+            except zmq.ZMQError:
+                pass

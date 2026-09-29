@@ -3,15 +3,23 @@
 
 #include <iostream>
 #include <fstream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <map>
+#include <set>
+#include <stdexcept>
 
 class ConfigParser {
+public:
+    using KeyValueMap = std::map<std::string, std::string>;
+    using SectionMap = std::map<std::string, KeyValueMap>;
+
 private:
-    std::map<std::string, std::map<std::string, std::string>> data_;
+    SectionMap data_;
 
     // [핵심] 문자열 양끝의 스페이스, 탭, 캐리지리턴(\r) 및 복붙 시 딸려오는 NBSP 제거
-    std::string trim(const std::string& str) {
+    static std::string trim(const std::string& str) {
         std::string s = str;
         // UTF-8 Non-Breaking Space(C2 A0)를 일반 공백으로 치환하여 파괴
         size_t pos;
@@ -25,58 +33,175 @@ private:
         return s.substr(first, (last - first + 1));
     }
 
-public:
-    ConfigParser(const std::string& filename) {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "\033[1;31m[ConfigParser Error] Cannot open file: \033[0m" << filename << std::endl;
-            return;
-        }
-
+    void Parse(std::istream& file, const std::string& source_name) {
         std::string line, current_section;
+        std::set<std::string> declared_sections;
+        size_t line_number = 0;
+        size_t parsed_entry_count = 0;
         while (std::getline(file, line)) {
+            ++line_number;
             line = trim(line);
-            
+
             // 주석(#, ;)이나 빈 줄은 가볍게 무시
             if (line.empty() || line[0] == '#' || line[0] == ';') continue;
 
-            // [Section] 인식
-            if (line.front() == '[' && line.back() == ']') {
-                current_section = trim(line.substr(1, line.size() - 2));
-            } 
-            // Key=Value 인식
-            else {
-                size_t eq_pos = line.find('=');
-                if (eq_pos != std::string::npos) {
-                    std::string key = trim(line.substr(0, eq_pos));
-                    std::string val = trim(line.substr(eq_pos + 1));
-                    data_[current_section][key] = val;
+            if (line.front() == '[') {
+                if (line.back() != ']') {
+                    throw std::runtime_error("Malformed config section in " +
+                                             source_name + " at line " +
+                                             std::to_string(line_number));
                 }
+                current_section = trim(line.substr(1, line.size() - 2));
+                if (current_section.empty()) {
+                    throw std::runtime_error("Empty config section in " +
+                                             source_name + " at line " +
+                                             std::to_string(line_number));
+                }
+                if (!declared_sections.insert(current_section).second) {
+                    throw std::runtime_error("Duplicate config section [" +
+                                             current_section + "] in " +
+                                             source_name + " at line " +
+                                             std::to_string(line_number));
+                }
+                // Preserve declared-but-empty sections so schema validation
+                // cannot miss an unknown section simply because it has no key.
+                data_.try_emplace(current_section);
+            } else {
+                size_t eq_pos = line.find('=');
+                if (eq_pos == std::string::npos || current_section.empty()) {
+                    throw std::runtime_error("Malformed config entry in " +
+                                             source_name + " at line " +
+                                             std::to_string(line_number));
+                }
+
+                std::string key = trim(line.substr(0, eq_pos));
+                std::string val = trim(line.substr(eq_pos + 1));
+                if (key.empty() || val.empty()) {
+                    throw std::runtime_error("Empty config key or value in " +
+                                             source_name + " at line " +
+                                             std::to_string(line_number));
+                }
+
+                auto& section = data_[current_section];
+                if (section.count(key)) {
+                    throw std::runtime_error("Duplicate config key [" +
+                                             current_section + "] " + key +
+                                             " in " + source_name + " at line " +
+                                             std::to_string(line_number));
+                }
+                section[key] = val;
+                ++parsed_entry_count;
             }
         }
+
+        if (file.bad()) {
+            throw std::runtime_error("Error while reading config: " + source_name);
+        }
+        if (parsed_entry_count == 0U) {
+            throw std::runtime_error("Config contains no settings: " + source_name);
+        }
     }
 
-    int GetInt(const std::string& section, const std::string& key, int default_val) {
-        if (data_.count(section) && data_[section].count(key)) {
-            try { return std::stoi(data_[section][key]); }
-            catch (...) { return default_val; }
+public:
+    explicit ConfigParser(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open config file: " + filename);
         }
-        return default_val;
+        Parse(file, filename);
     }
 
-    double GetDouble(const std::string& section, const std::string& key, double default_val) {
-        if (data_.count(section) && data_[section].count(key)) {
-            try { return std::stod(data_[section][key]); }
-            catch (...) { return default_val; }
-        }
-        return default_val;
+    static ConfigParser FromText(const std::string& contents,
+                                 const std::string& source_name) {
+        std::istringstream input(contents);
+        ConfigParser parsed;
+        parsed.Parse(input, source_name);
+        return parsed;
     }
 
-    std::string GetString(const std::string& section, const std::string& key, const std::string& default_val) {
-        if (data_.count(section) && data_[section].count(key)) {
-            return data_[section][key];
+    int GetInt(const std::string& section, const std::string& key, int default_val) const {
+        auto section_it = data_.find(section);
+        if (section_it == data_.end()) return default_val;
+
+        auto value_it = section_it->second.find(key);
+        if (value_it == section_it->second.end()) return default_val;
+        return ParseInt(section, key, value_it->second);
+    }
+
+    int GetRequiredInt(const std::string& section, const std::string& key,
+                       int min_value = std::numeric_limits<int>::min(),
+                       int max_value = std::numeric_limits<int>::max()) const {
+        auto section_it = data_.find(section);
+        if (section_it == data_.end()) {
+            throw std::runtime_error("Missing required config section [" + section + "]");
         }
-        return default_val;
+
+        auto value_it = section_it->second.find(key);
+        if (value_it == section_it->second.end()) {
+            throw std::runtime_error("Missing required config key [" + section + "] " + key);
+        }
+
+        int value = ParseInt(section, key, value_it->second);
+        if (value < min_value || value > max_value) {
+            throw std::runtime_error("Config value out of range [" + section + "] " + key +
+                                     "=" + value_it->second + " (expected " +
+                                     std::to_string(min_value) + ".." +
+                                     std::to_string(max_value) + ")");
+        }
+        return value;
+    }
+
+    double GetDouble(const std::string& section, const std::string& key, double default_val) const {
+        auto section_it = data_.find(section);
+        if (section_it == data_.end()) return default_val;
+
+        auto value_it = section_it->second.find(key);
+        if (value_it == section_it->second.end()) return default_val;
+
+        try {
+            size_t consumed = 0;
+            double value = std::stod(value_it->second, &consumed);
+            if (consumed != value_it->second.size()) throw std::invalid_argument("trailing characters");
+            return value;
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid floating-point config value [" + section +
+                                     "] " + key + "=" + value_it->second);
+        }
+    }
+
+    std::string GetString(const std::string& section, const std::string& key,
+                          const std::string& default_val) const {
+        auto section_it = data_.find(section);
+        if (section_it == data_.end()) return default_val;
+
+        auto value_it = section_it->second.find(key);
+        if (value_it == section_it->second.end()) return default_val;
+        return value_it->second;
+    }
+
+    // DAQConfig validates the complete parsed schema before consuming any
+    // values.  Exposing a const view prevents typos from being silently
+    // ignored by optional getters while keeping ConfigParser generally useful.
+    const SectionMap& GetSections() const noexcept { return data_; }
+
+private:
+    ConfigParser() = default;
+
+    static int ParseInt(const std::string& section, const std::string& key,
+                        const std::string& raw_value) {
+        try {
+            size_t consumed = 0;
+            long long value = std::stoll(raw_value, &consumed, 10);
+            if (consumed != raw_value.size() ||
+                value < std::numeric_limits<int>::min() ||
+                value > std::numeric_limits<int>::max()) {
+                throw std::invalid_argument("not a complete integer");
+            }
+            return static_cast<int>(value);
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid integer config value [" + section + "] " +
+                                     key + "=" + raw_value);
+        }
     }
 };
 

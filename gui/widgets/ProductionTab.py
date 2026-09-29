@@ -1,19 +1,38 @@
 import re
 import os
+import html
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
                              QPushButton, QProgressBar, QLabel, QLineEdit, 
-                             QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSlot, QSettings, QProcess
+                             QTextEdit, QSpinBox, QFileDialog, QGridLayout, QCheckBox,
+                             QComboBox)
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSettings, QProcess, QTimer
 from core.DatabaseManager import DatabaseManager
+from widgets.ProductionBatch import ProductionBatch
+from core.runtime_paths import (
+    RuntimeValidationError,
+    build_production_arguments,
+    default_production_output,
+    file_identity,
+    find_project_root,
+    identity_summary,
+    production_sources,
+    require_file,
+    resolve_path,
+    verify_binary_fresh,
+    verify_deployed_gui,
+    verify_expected_hashes,
+)
 
 class ProductionTab(QWidget):
+    STOP_GRACE_MSEC = 5000
+
+    rootOutputReady = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         
-        curr = os.path.abspath(os.path.dirname(__file__))
-        while curr != '/' and not os.path.exists(os.path.join(curr, 'CMakeLists.txt')):
-            curr = os.path.dirname(curr)
-        self.proj_dir = curr if curr != '/' else os.getcwd()
+        self.proj_dir = str(find_project_root(__file__))
+        self.runtime_gui_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         self.bin_dir = os.path.join(self.proj_dir, "bin")
         self.data_dir = os.path.join(self.proj_dir, "data")
@@ -22,14 +41,38 @@ class ProductionTab(QWidget):
         self.settings = QSettings("CPNR", "DT5730S_ProductionTab")
         self.db = DatabaseManager(os.path.join(self.data_dir, "run_history.db"))
         
-        self.process = QProcess()
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.SeparateChannels
+        )
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.handle_finished)
+        self.process.errorOccurred.connect(self.handle_process_error)
+        self._stop_grace_timer = QTimer(self)
+        self._stop_grace_timer.setSingleShot(True)
+        self._stop_grace_timer.timeout.connect(self._handle_stop_timeout)
         
         self.last_stats = {}; self.current_raw_file = ""
+        self.current_root_output = ""
+        self.completed_run_context = None
+        self._stderr_buffer = ""
+        self._stdout_buffer = ""
+        self._stderr_history = ""
+        self._last_launch_error = ""
+        self._pending_run_context = None
+        self._run_active = False
+        self._cancel_requested = False
+        self._active_db_run_id = None
+        self._active_run_uuid = None
+        self._db_production_begun = False
+        self._db_terminal_recorded = False
+        self._active_debug_mode = False
+        self._auto_force_on_timeout = False
+        self._force_stop_offered = False
         self.init_ui()
         self.load_settings()
+        self._sync_busy_controls()
         self.log_pattern = re.compile(r"\[Progress\]\s+([0-9.]+)%\s+\|\s+Events:\s+(\d+)\s+\|\s+Speed:\s+([0-9.]+)\s+MB/s\s+\|\s+ETA:\s+(\d+)")
 
     def init_ui(self):
@@ -38,6 +81,7 @@ class ProductionTab(QWidget):
         io_group.setStyleSheet("QGroupBox { font-weight: bold; color: #17a2b8; }")
         io_layout = QGridLayout()
         self.input_edit = QLineEdit()
+        self.input_edit.textEdited.connect(self._raw_input_edited)
         self.btn_browse_in = QPushButton("Browse Raw")
         self.btn_browse_in.clicked.connect(self.browse_input)
         self.output_edit = QLineEdit()
@@ -46,7 +90,60 @@ class ProductionTab(QWidget):
         self.btn_browse_out.clicked.connect(self.browse_output)
         io_layout.addWidget(QLabel("Input Raw (.dat):"), 0, 0); io_layout.addWidget(self.input_edit, 0, 1); io_layout.addWidget(self.btn_browse_in, 0, 2)
         io_layout.addWidget(QLabel("Output ROOT (.root):"), 1, 0); io_layout.addWidget(self.output_edit, 1, 1); io_layout.addWidget(self.btn_browse_out, 1, 2)
+
+        self.config_edit = QLineEdit()
+        self.config_edit.setPlaceholderText("Exact run snapshot (*.dat.config.conf)")
+        self.btn_browse_config = QPushButton("Browse Config")
+        self.btn_browse_config.clicked.connect(self.browse_config)
+        io_layout.addWidget(QLabel("Run Config (.conf):"), 2, 0)
+        io_layout.addWidget(self.config_edit, 2, 1)
+        io_layout.addWidget(self.btn_browse_config, 2, 2)
+
+        self.metadata_edit = QLineEdit()
+        self.metadata_edit.setPlaceholderText("Exact runtime metadata (*.dat.run.json)")
+        self.btn_browse_metadata = QPushButton("Browse Metadata")
+        self.btn_browse_metadata.clicked.connect(self.browse_metadata)
+        io_layout.addWidget(QLabel("Run Metadata (.json):"), 3, 0)
+        io_layout.addWidget(self.metadata_edit, 3, 1)
+        io_layout.addWidget(self.btn_browse_metadata, 3, 2)
+
+        self.spin_run_number = QSpinBox()
+        self.spin_run_number.setRange(0, 2147483647)
+        self.spin_run_number.setSpecialValueText("Auto (metadata / filename suffix)")
+        io_layout.addWidget(QLabel("Run Number:"), 4, 0)
+        io_layout.addWidget(self.spin_run_number, 4, 1)
+
+        self.lbl_production_identity = QLabel()
+        self.lbl_production_identity.setWordWrap(True)
+        self.lbl_production_identity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        io_layout.addWidget(QLabel("Resolved production:"), 5, 0)
+        io_layout.addWidget(self.lbl_production_identity, 5, 1, 1, 2)
+        self.chk_verify_metadata = QCheckBox("Verify original run config + metadata (optional)")
+        self.chk_verify_metadata.toggled.connect(self.toggle_metadata_ui)
+        io_layout.addWidget(self.chk_verify_metadata, 6, 0, 1, 3)
+        basic_layout = QHBoxLayout()
+        self.combo_basic_polarity = QComboBox()
+        self.combo_basic_polarity.addItems(["falling", "rising"])
+        self.spin_basic_baseline = QSpinBox()
+        self.spin_basic_baseline.setRange(1, 102400)
+        self.spin_basic_baseline.setValue(150)
+        basic_layout.addWidget(QLabel("Basic analysis polarity:"))
+        basic_layout.addWidget(self.combo_basic_polarity)
+        basic_layout.addWidget(QLabel("Baseline samples (from record start):"))
+        basic_layout.addWidget(self.spin_basic_baseline)
+        io_layout.addLayout(basic_layout, 7, 0, 1, 3)
+        self.lbl_basic_note = QLabel(
+            "DAT-only: acquisition settings/completion are NOT verified. "
+            "Select pulse polarity and a pulse-free baseline window. "
+            "Schema 3: peak [-20,+40) ns charge (ADC·sample); "
+            "height/baseline in ADC counts, no assumed mV range."
+        )
+        self.lbl_basic_note.setWordWrap(True)
+        io_layout.addWidget(self.lbl_basic_note, 8, 0, 1, 3)
         io_group.setLayout(io_layout); layout.addWidget(io_group)
+        self.io_group = io_group
 
         opt_group = QGroupBox("Conversion Options & Time-Machine Debugger")
         opt_layout = QHBoxLayout()
@@ -60,9 +157,10 @@ class ProductionTab(QWidget):
         self.btn_run = QPushButton("Run ROOT Conversion")
         self.btn_run.setStyleSheet("background-color: #5bc0de; color: white; font-weight: bold; padding: 8px;")
         self.btn_run.clicked.connect(self.run_conversion)
-        self.btn_stop = QPushButton("Force Stop")
+        self.btn_stop = QPushButton("Stop Conversion")
         self.btn_stop.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 8px;")
         self.btn_stop.clicked.connect(self.stop_all)
+        self.btn_stop.setEnabled(False)
         
         self.btn_prev = QPushButton("Prev (p)"); self.btn_next = QPushButton("Next (n)"); self.btn_jump = QPushButton("Jump (j)")
         self.spin_jump = QSpinBox(); self.spin_jump.setRange(0, 9999999)
@@ -76,6 +174,15 @@ class ProductionTab(QWidget):
         opt_layout.addWidget(self.btn_prev); opt_layout.addWidget(self.btn_next); opt_layout.addWidget(self.spin_jump); opt_layout.addWidget(self.btn_jump); opt_layout.addWidget(self.btn_quit)
         opt_group.setLayout(opt_layout); layout.addWidget(opt_group)
 
+        batch_group = QGroupBox("Batch Production")
+        batch_layout = QVBoxLayout(batch_group)
+        self.batch = ProductionBatch(self.proj_dir, self)
+        self.batch.btn_start.clicked.connect(self.start_batch)
+        self.batch.jobRequested.connect(self._run_batch_job)
+        self.batch.activeChanged.connect(self._batch_active_changed)
+        batch_layout.addWidget(self.batch)
+        layout.addWidget(batch_group)
+
         dash_group = QGroupBox("Conversion Status Dashboard")
         dash_layout = QVBoxLayout()
         self.progress_bar = QProgressBar(); self.progress_bar.setValue(0); self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter); self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #5cb85c; }")
@@ -87,13 +194,99 @@ class ProductionTab(QWidget):
         layout.addWidget(dash_group)
 
         self.log_console = QTextEdit(); self.log_console.setReadOnly(True); self.log_console.setMaximumHeight(200)
+        self.log_console.document().setMaximumBlockCount(3000)
         self.log_console.setStyleSheet("background-color: #f8f9fa; color: #333333; font-family: monospace; border: 1px solid #ced4da;")
         layout.addWidget(self.log_console)
         self.setLayout(layout)
         self.set_debug_controls_enabled(False)
 
     def toggle_debug_ui(self, state):
-        self.spin_debug_start.setEnabled(self.chk_debug_mode.isChecked())
+        self.spin_debug_start.setEnabled(
+            self.chk_debug_mode.isChecked() and not self.has_pending_work()
+        )
+
+    def has_pending_work(self):
+        return (self._run_active or self.batch.active or
+                self.process.state() != QProcess.ProcessState.NotRunning)
+
+    def _sync_busy_controls(self):
+        busy = self.has_pending_work()
+        self.io_group.setEnabled(not busy)
+        self.chk_save_waveforms.setEnabled(not busy)
+        self.chk_debug_mode.setEnabled(not busy)
+        self.spin_debug_start.setEnabled(not busy and self.chk_debug_mode.isChecked())
+        self.btn_run.setEnabled(not busy)
+        self.batch.set_busy(busy)
+        if self.batch.active and not self._cancel_requested:
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.setText("Stop Batch")
+        elif not busy:
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stop Conversion")
+        if not busy and self._pending_run_context is not None:
+            context = self._pending_run_context
+            self._pending_run_context = None
+            self.set_run_context(context)
+
+    def start_batch(self):
+        if self.has_pending_work():
+            return
+        if self.chk_debug_mode.isChecked():
+            self.log_console.append("[Batch] Turn off Interactive Debug Mode before starting a batch.")
+            return
+        if not self.batch.jobs:
+            return
+        self.save_settings()
+        self.log_console.clear()
+        self._cancel_requested = False
+        self.batch.start({
+            "verified": self.chk_verify_metadata.isChecked(),
+            "polarity": self.combo_basic_polarity.currentText(),
+            "baseline_samples": self.spin_basic_baseline.value(),
+            "save_waveforms": self.chk_save_waveforms.isChecked(),
+        })
+
+    def _batch_active_changed(self, active):
+        self.log_console.append(
+            "[Batch] Started: outputs beside each DAT; automatic per-file run number."
+            if active else "[Batch] Finished. " + self.batch.summary.text()
+        )
+        self._sync_busy_controls()
+
+    def _run_batch_job(self, job):
+        self.log_console.append(f"<b>[Batch] Input:</b> {html.escape(job['raw'])}")
+        launched = self._launch_conversion(
+            # Let the converter derive its no-clobber default itself. Resolving
+            # an explicit output through a newly-created symlink could redirect
+            # the destination between the queue check and process launch.
+            raw_value=job["raw"], output_value="",
+            config_value=job["raw"] + ".config.conf" if job["verified"] else "",
+            metadata_value=job["raw"] + ".run.json" if job["verified"] else "",
+            run_number=0, verified=job["verified"], polarity=job["polarity"],
+            baseline_samples=job["baseline_samples"], save_waveforms=job["save_waveforms"],
+            debug_event_id=None, context={},
+        )
+        if not launched:
+            self.batch.complete_current("Failed", self._last_launch_error)
+            self._sync_busy_controls()
+
+    def toggle_metadata_ui(self, checked):
+        for widget in (self.config_edit, self.metadata_edit,
+                       self.btn_browse_config, self.btn_browse_metadata):
+            widget.setEnabled(checked)
+        self.combo_basic_polarity.setEnabled(not checked)
+        self.spin_basic_baseline.setEnabled(not checked)
+        self.lbl_basic_note.setVisible(not checked)
+
+    def _raw_input_edited(self, _text):
+        # Never reuse a previous DAQ's run number, output or sidecars for a
+        # manually selected input. set_run_context supplies verified identity.
+        self.completed_run_context = None
+        self.spin_run_number.setValue(0)
+        self.output_edit.clear()
+        self.config_edit.clear()
+        self.metadata_edit.clear()
+        self.chk_verify_metadata.setChecked(False)
 
     def set_debug_controls_enabled(self, enabled):
         self.btn_prev.setEnabled(enabled); self.btn_next.setEnabled(enabled); self.spin_jump.setEnabled(enabled); self.btn_jump.setEnabled(enabled); self.btn_quit.setEnabled(enabled)
@@ -101,69 +294,419 @@ class ProductionTab(QWidget):
     def load_settings(self):
         self.input_edit.setText(self.settings.value("last_prod_input", ""))
         self.output_edit.setText(self.settings.value("last_prod_output", ""))
+        self.config_edit.setText(self.settings.value("last_prod_config", ""))
+        self.metadata_edit.setText(self.settings.value("last_prod_metadata", ""))
+        self.spin_run_number.setValue(
+            int(self.settings.value("last_prod_run_number", 0))
+        )
+        self.chk_verify_metadata.setChecked(
+            self.settings.value(
+                "verify_metadata",
+                bool(self.config_edit.text() and self.metadata_edit.text()),
+                type=bool,
+            )
+        )
+        self.combo_basic_polarity.setCurrentText(
+            self.settings.value("basic_polarity", "falling")
+        )
+        self.spin_basic_baseline.setValue(
+            int(self.settings.value("basic_baseline_samples", 150))
+        )
+        self.toggle_metadata_ui(self.chk_verify_metadata.isChecked())
         self.chk_save_waveforms.setChecked(self.settings.value("last_save_wave", False, type=bool))
+        self.refresh_runtime_identity()
 
     def save_settings(self):
         self.settings.setValue("last_prod_input", self.input_edit.text())
         self.settings.setValue("last_prod_output", self.output_edit.text())
+        self.settings.setValue("last_prod_config", self.config_edit.text())
+        self.settings.setValue("last_prod_metadata", self.metadata_edit.text())
+        self.settings.setValue("last_prod_run_number", self.spin_run_number.value())
+        self.settings.setValue("verify_metadata", self.chk_verify_metadata.isChecked())
+        self.settings.setValue("basic_polarity", self.combo_basic_polarity.currentText())
+        self.settings.setValue("basic_baseline_samples", self.spin_basic_baseline.value())
         self.settings.setValue("last_save_wave", self.chk_save_waveforms.isChecked())
+
+    def refresh_runtime_identity(self):
+        executable = os.path.join(self.bin_dir, "production_dt5730")
+        try:
+            identity = file_identity(executable)
+            self.lbl_production_identity.setText(identity_summary(identity))
+            self.lbl_production_identity.setStyleSheet("color: #495057;")
+        except OSError as exc:
+            self.lbl_production_identity.setText(
+                f"UNAVAILABLE: {executable} ({exc})"
+            )
+            self.lbl_production_identity.setStyleSheet(
+                "color: #dc3545; font-weight: bold;"
+            )
 
     def browse_input(self):
         last_dir = os.path.dirname(os.path.join(self.proj_dir, self.input_edit.text())) if self.input_edit.text() else self.data_dir
         fname, _ = QFileDialog.getOpenFileName(self, "Open Raw Data", last_dir, "Data Files (*.dat)")
-        if fname: self.input_edit.setText(os.path.relpath(fname, self.proj_dir)); self.save_settings()
+        if fname:
+            self._raw_input_edited(fname)
+            self.input_edit.setText(os.path.relpath(fname, self.proj_dir))
+            for field, suffix in ((self.config_edit, ".config.conf"),
+                                  (self.metadata_edit, ".run.json")):
+                if os.path.isfile(fname + suffix):
+                    field.setText(fname + suffix)
+            self.save_settings()
 
     def browse_output(self):
         last_dir = os.path.dirname(os.path.join(self.proj_dir, self.output_edit.text())) if self.output_edit.text() else self.data_dir
         fname, _ = QFileDialog.getSaveFileName(self, "Save ROOT Data", last_dir, "ROOT Files (*.root)")
         if fname: self.output_edit.setText(os.path.relpath(fname, self.proj_dir)); self.save_settings()
 
-    def run_conversion(self):
+    def browse_config(self):
+        last_dir = (
+            os.path.dirname(str(resolve_path(self.proj_dir, self.config_edit.text())))
+            if self.config_edit.text().strip() else self.data_dir
+        )
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Open Exact Run Config", last_dir, "Config Files (*.conf);;All Files (*)"
+        )
+        if fname:
+            self.config_edit.setText(os.path.abspath(fname))
+            self.save_settings()
+
+    def browse_metadata(self):
+        last_dir = (
+            os.path.dirname(str(resolve_path(self.proj_dir, self.metadata_edit.text())))
+            if self.metadata_edit.text().strip() else self.data_dir
+        )
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Open Runtime Metadata", last_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if fname:
+            self.metadata_edit.setText(os.path.abspath(fname))
+            self.save_settings()
+
+    @pyqtSlot(dict)
+    def set_run_context(self, context):
+        """Populate conversion provenance from a successfully completed DAQ run."""
+
+        if self.has_pending_work():
+            self._pending_run_context = dict(context)
+            self.log_console.append(
+                "[Run Context] A new DAQ context arrived; deferred until production is idle."
+            )
+            return
+        self.completed_run_context = dict(context)
+        self.input_edit.setText(context.get("raw_file", ""))
+        self.config_edit.setText(context.get("config_path", ""))
+        self.metadata_edit.setText(context.get("metadata_path", ""))
+        run_number = int(context.get("run_number", 1))
+        self.spin_run_number.setValue(max(1, run_number))
+        self.chk_verify_metadata.setChecked(True)
+        self.output_edit.clear()
         self.save_settings()
-        self.current_raw_file = self.input_edit.text().strip(); out_file = self.output_edit.text().strip()
-        if not self.current_raw_file:
-            self.log_console.append("<span style='color:red;'>[Error] Please select input file!</span>"); return
-        if out_file:
-            out_file_full = os.path.abspath(os.path.join(self.proj_dir, out_file))
-            os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
-            
-        args = ["-i", self.current_raw_file]
-        if out_file: args.extend(["-o", out_file])
-        if self.chk_save_waveforms.isChecked(): args.append("-w")
-        is_debug_mode = self.chk_debug_mode.isChecked()
-        if is_debug_mode: args.extend(["-d", str(self.spin_debug_start.value())])
-            
-        self.progress_bar.setValue(0); self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
-        self.log_console.clear(); self.last_stats = {}
-        
-        exe_path = os.path.join(self.bin_dir, "production_dt5730")
-        if not os.path.exists(exe_path):
-            self.log_console.append(f"<span style='color:red;'>[Error] Executable not found at: {exe_path}. Did you run 'make'?</span>"); return
+        metadata_note = "ready" if context.get("metadata_exists") else "MISSING"
+        self.log_console.append(
+            "<b>[Run Context]</b> Completed DAQ context loaded: "
+            f"run={run_number}, metadata={metadata_note}"
+        )
 
-        self.btn_run.setEnabled(False); self.set_debug_controls_enabled(is_debug_mode)
-        self.log_console.append(f"<b>[System] Starting:</b> {exe_path} {' '.join(args)}")
+    def run_conversion(self):
+        if self.has_pending_work():
+            self.log_console.append(
+                "<span style='color:#b45309;'>[Warning] Conversion이 이미 "
+                "실행 중이므로 중복 실행하지 않았습니다.</span>"
+            )
+            return
+        self.save_settings()
+        self._launch_conversion(
+            raw_value=self.input_edit.text().strip(),
+            config_value=self.config_edit.text().strip(),
+            metadata_value=self.metadata_edit.text().strip(),
+            output_value=self.output_edit.text().strip(),
+            run_number=self.spin_run_number.value(),
+            verified=self.chk_verify_metadata.isChecked(),
+            polarity=self.combo_basic_polarity.currentText(),
+            baseline_samples=self.spin_basic_baseline.value(),
+            save_waveforms=self.chk_save_waveforms.isChecked(),
+            debug_event_id=self.spin_debug_start.value() if self.chk_debug_mode.isChecked() else None,
+            context=dict(self.completed_run_context or {}),
+        )
+
+    def _launch_conversion(self, *, raw_value, config_value, metadata_value,
+                           output_value, run_number, verified, polarity,
+                           baseline_samples, save_waveforms, debug_event_id, context):
+        self._last_launch_error = ""
+        if self._run_active or self.process.state() != QProcess.ProcessState.NotRunning:
+            self._last_launch_error = "A conversion process is already active"
+            return False
+        if not raw_value or (verified and (not config_value or not metadata_value)):
+            self._last_launch_error = "DAT input is required; verified mode also requires config and metadata"
+            self.log_console.append(
+                "<span style='color:red;'>[Error] Select a DAT input. "
+                "Verified mode also requires the exact run config and metadata.</span>"
+            )
+            return False
+
+        try:
+            verify_deployed_gui(self.runtime_gui_dir, self.proj_dir)
+            raw_path = require_file(
+                resolve_path(self.proj_dir, raw_value), description="raw 입력 파일"
+            )
+            config_path = require_file(
+                resolve_path(self.proj_dir, config_value), description="run config snapshot"
+            ) if verified else None
+            metadata_path = require_file(
+                resolve_path(self.proj_dir, metadata_value), description="runtime metadata"
+            ) if verified else None
+            executable = os.path.join(self.bin_dir, "production_dt5730")
+            executable_identity = verify_binary_fresh(
+                executable, production_sources(self.proj_dir)
+            )
+            config_identity = file_identity(config_path) if verified else None
+            metadata_identity = file_identity(metadata_path) if verified else None
+            context_raw = context.get("raw_file")
+            if verified and context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
+                expected_config = resolve_path(
+                    self.proj_dir, context.get("config_path", "")
+                )
+                expected_metadata = resolve_path(
+                    self.proj_dir, context.get("metadata_path", "")
+                )
+                if expected_config != config_path or expected_metadata != metadata_path:
+                    raise RuntimeValidationError(
+                        "완료된 DAQ context의 config/metadata 경로와 현재 선택이 "
+                        "다릅니다."
+                    )
+                if (context.get("config_sha256") and
+                        context["config_sha256"] != config_identity["sha256"]):
+                    raise RuntimeValidationError(
+                        "DAQ 완료 후 config snapshot 내용이 변경되었습니다."
+                    )
+                if (context.get("metadata_sha256") and
+                        context["metadata_sha256"] != metadata_identity["sha256"]):
+                    raise RuntimeValidationError(
+                        "DAQ 완료 후 runtime metadata 내용이 변경되었습니다."
+                    )
+            output_path = (
+                resolve_path(self.proj_dir, output_value)
+                if output_value else None
+            )
+            if output_path:
+                os.makedirs(output_path.parent, exist_ok=True)
+            is_debug_mode = debug_event_id is not None
+            resolved_root_output = (
+                output_path or default_production_output(raw_path)
+            )
+            if not is_debug_mode and os.path.lexists(resolved_root_output):
+                raise RuntimeValidationError(
+                    "production ROOT output already exists; refusing to "
+                    f"overwrite or trust a stale file: {resolved_root_output}"
+                )
+            args = build_production_arguments(
+                raw_path,
+                config_path,
+                run_number,
+                metadata_path,
+                root_output=(None if is_debug_mode else output_path),
+                save_waveforms=save_waveforms,
+                debug_event_id=debug_event_id,
+                basic=not verified,
+                polarity=polarity,
+                baseline_samples=baseline_samples,
+            )
+            expected_hashes = {executable: executable_identity["sha256"]}
+            if verified:
+                expected_hashes[str(config_path)] = config_identity["sha256"]
+                expected_hashes[str(metadata_path)] = metadata_identity["sha256"]
+            verify_expected_hashes(expected_hashes)
+        except (OSError, RuntimeValidationError) as exc:
+            self._last_launch_error = str(exc)
+            self.log_console.append(
+                f"<span style='color:red;'>[Error] Conversion launch blocked: "
+                f"{html.escape(str(exc))}</span>"
+            )
+            return False
+
+        self.current_raw_file = str(raw_path)
+        self.current_root_output = (
+            "" if is_debug_mode else str(resolved_root_output)
+        )
+        self.progress_bar.setValue(0); self.progress_bar.setFormat("%p%")
+        self.lbl_events.setText("Events: 0"); self.lbl_speed.setText("Speed: 0.0 MB/s"); self.lbl_eta.setText("ETA: 0 s")
+        if not self.batch.active:
+            self.log_console.clear()
+        self.last_stats = {}
+        self._stderr_buffer = ""
+        self._stdout_buffer = ""
+        self._stderr_history = ""
+        self._run_active = True
+        self._cancel_requested = False
+        self._active_debug_mode = is_debug_mode
+        self._auto_force_on_timeout = False
+        self._force_stop_offered = False
+        self._stop_grace_timer.stop()
+        self._db_terminal_recorded = False
+        self._active_db_run_id = None
+        self._active_run_uuid = None
+        self._db_production_begun = False
+        context_db_identity_supplied = False
+        if context_raw and resolve_path(self.proj_dir, context_raw) == raw_path:
+            context_run_id = context.get("db_run_id")
+            context_run_uuid = context.get("run_uuid")
+            context_db_identity_supplied = context_run_id is not None
+            if context_run_id is not None and context_run_uuid:
+                try:
+                    resolved_run = self.db.resolve_run_identity(
+                        int(context_run_id),
+                        run_uuid=context_run_uuid,
+                        output_file=raw_path,
+                    )
+                    self._active_db_run_id = int(resolved_run["id"])
+                    self._active_run_uuid = str(resolved_run["run_uuid"])
+                except Exception as db_exc:
+                    self.log_console.append(
+                        "<span style='color:red;'>[DB Error] 전달된 run "
+                        "id/UUID/raw identity가 현재 DB와 일치하지 않습니다. "
+                        f"잘못된 행은 갱신하지 않습니다: "
+                        f"{html.escape(str(db_exc))}</span>"
+                    )
+            elif context_run_id is not None:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] 전달된 DAQ context에 "
+                    "run_uuid가 없어 정수 id만으로 DB 행을 갱신하지 "
+                    "않습니다.</span>"
+                )
+        if self._active_db_run_id is None and not context_db_identity_supplied:
+            try:
+                self._active_db_run_id = self.db.find_run_id_by_output(raw_path)
+                if self._active_db_run_id is not None:
+                    self._active_run_uuid = self.db.get_run_uuid(
+                        self._active_db_run_id
+                    )
+            except Exception as db_exc:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] Run identity lookup "
+                    f"failed: {html.escape(str(db_exc))}</span>"
+                )
+        self.lbl_production_identity.setText(identity_summary(executable_identity))
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("Stop Debug" if is_debug_mode else "Stop Conversion")
+        self.set_debug_controls_enabled(is_debug_mode)
+        self.log_console.append(
+            f"<b>[Runtime] Production:</b> {identity_summary(executable_identity)}"
+        )
+        if verified:
+            self.log_console.append(
+                f"<b>[Runtime] Config:</b> {identity_summary(config_identity)}"
+            )
+            self.log_console.append(
+                f"<b>[Runtime] Metadata:</b> {identity_summary(metadata_identity)}"
+            )
+        else:
+            self.log_console.append(
+                "<b>[Warning] Basic DAT-only conversion:</b> acquisition "
+                "settings/completion and historical integrity are NOT verified."
+            )
+        self.log_console.append(f"<b>[System] Starting:</b> {executable} {' '.join(args)}")
+        if self._active_db_run_id is not None and not is_debug_mode:
+            try:
+                self.db.begin_production(
+                    self._active_db_run_id,
+                    run_uuid=self._active_run_uuid,
+                    output_file=self.current_raw_file,
+                )
+                self._db_production_begun = True
+            except Exception as db_exc:
+                self.log_console.append(
+                    "<span style='color:red;'>[DB Error] Production launch "
+                    f"status was not recorded: {html.escape(str(db_exc))}</span>"
+                )
+        elif is_debug_mode:
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[Lifecycle]</b> Debug mode "
+                "is read-only and will not change production DB status.</span>"
+            )
         self.process.setWorkingDirectory(self.proj_dir)
-        self.process.start(exe_path, args)
+        self._sync_busy_controls()
+        self.process.start(str(executable), args)
+        return True
 
-    def stop_all(self):
-        if self.process.state() == QProcess.ProcessState.Running:
+    def stop_all(self, auto_force=False):
+        # Cancel queued work before terminating the child, including the
+        # no-child gap and the application's shutdown path.
+        self.batch.stop()
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            if self._force_stop_offered and not auto_force:
+                self.force_stop()
+                return
+            self._cancel_requested = True
+            self._auto_force_on_timeout = (
+                self._auto_force_on_timeout or bool(auto_force)
+            )
             self.process.terminate()
-            self.process.waitForFinished(1000)
-            if self.process.state() == QProcess.ProcessState.Running: self.process.kill()
-            self.log_console.append("<span style='color:red;'>[System] Conversion forcefully stopped.</span>")
-            self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stopping…")
+            if not self._stop_grace_timer.isActive():
+                self._stop_grace_timer.start(self.STOP_GRACE_MSEC)
+            self.log_console.append(
+                "<span style='color:#b45309;'>[System] Graceful conversion "
+                f"stop requested; waiting up to {self.STOP_GRACE_MSEC / 1000:g} "
+                "s for finalization.</span>"
+            )
+
+    def force_stop(self):
+        """Explicit recovery action; normal Stop never blocks or kills."""
+
+        self.batch.stop()
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_requested = True
+            self._stop_grace_timer.stop()
+            self._force_stop_offered = False
+            self.btn_stop.setEnabled(False)
+            self.process.kill()
+            self.log_console.append(
+                "<span style='color:red;'>[System] Explicit force stop "
+                "requested. Without terminal output truth this run remains "
+                "interrupted/unknown.</span>"
+            )
+
+    @pyqtSlot()
+    def _handle_stop_timeout(self):
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._force_stop_offered = True
+        if self._auto_force_on_timeout:
+            self.log_console.append(
+                "<span style='color:red;'>[System] Graceful conversion stop "
+                "deadline expired during application shutdown; automatically "
+                "force-stopping the child.</span>"
+            )
+            self.force_stop()
+        else:
+            self.btn_stop.setText("Force Stop Conversion")
+            self.btn_stop.setEnabled(True)
+            self.log_console.append(
+                "<span style='color:#b45309;'>[Warning] Conversion child did "
+                "not stop within the grace period. Force Stop Conversion is "
+                "now available.</span>"
+            )
 
     def send_debug_command(self, cmd_str):
         if self.process.state() == QProcess.ProcessState.Running: self.process.write(cmd_str.encode('utf-8'))
 
     @pyqtSlot()
     def handle_stdout(self):
-        while self.process.canReadLine():
-            line = self.process.readLine().data().decode('utf-8', errors='ignore').strip()
+        self._stdout_buffer += bytes(self.process.readAllStandardOutput()).decode(
+            'utf-8', errors='replace'
+        )
+        # Production prints progress with carriage returns, without newlines.
+        lines = re.split(r'[\r\n]', self._stdout_buffer)
+        self._stdout_buffer = lines.pop()
+        for line in lines:
+            line = line.strip()
             if not line: continue
             clean_line = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('', line)
             match = self.log_pattern.search(clean_line)
             if match:
+                self.batch.set_current_progress(float(match.group(1)))
                 self.progress_bar.setValue(int(float(match.group(1)))); self.lbl_events.setText(f"Events: {int(match.group(2)):,}")
                 self.lbl_speed.setText(f"Speed: {match.group(3)} MB/s"); self.lbl_eta.setText(f"ETA: {match.group(4)} s")
                 self.last_stats = {"events": match.group(2), "avg_speed": match.group(3)}
@@ -173,17 +716,231 @@ class ProductionTab(QWidget):
 
     @pyqtSlot()
     def handle_stderr(self):
-        while self.process.canReadLine():
-            line = self.process.readLine().data().decode('utf-8', errors='ignore').strip()
-            if line: self.log_console.append(f"<span style='color:red;'>{line}</span>")
+        payload = bytes(self.process.readAllStandardError()).decode(
+            'utf-8', errors='replace'
+        )
+        if payload:
+            self._stderr_history = (self._stderr_history + payload)[-4096:]
+            self._stderr_buffer += payload
+            self._consume_stderr(final=False)
+
+    def _consume_stderr(self, final=False):
+        lines = self._stderr_buffer.splitlines(keepends=True)
+        remainder = ""
+        if (
+            lines
+            and not final
+            and not lines[-1].endswith(('\n', '\r'))
+        ):
+            remainder = lines.pop()
+        self._stderr_buffer = remainder
+        for raw_line in lines:
+            line = raw_line.rstrip('\r\n')
+            if line:
+                self.log_console.append(
+                    "<span style='color:red;'>"
+                    f"{html.escape(line)}</span>"
+                )
+
+    def handle_process_error(self, process_error):
+        self.handle_stderr()
+        error_text = html.escape(self.process.errorString())
+        self.log_console.append(
+            "<span style='color:red;'><b>[Process Error]</b> "
+            f"{error_text} ({process_error.name})</span>"
+        )
+        if process_error == QProcess.ProcessError.FailedToStart:
+            self._stop_grace_timer.stop()
+            self._run_active = False
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Failed to start")
+            self.btn_run.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stop Conversion")
+            self.set_debug_controls_enabled(False)
+            self._record_production_terminal(
+                "production_launch_failed", -1,
+                error_message=self.process.errorString(),
+            )
+            self._active_debug_mode = False
+            self.batch.complete_current("Failed", self.process.errorString())
+            self._sync_busy_controls()
+
+    def _record_production_terminal(
+        self, status, exit_code, *, root_file=None, error_message=None
+    ):
+        if self._db_terminal_recorded:
+            return
+        if self._active_debug_mode:
+            self._db_terminal_recorded = True
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[Lifecycle]</b> Debug session "
+                "ended without changing production lifecycle state.</span>"
+            )
+            return
+        if self._active_db_run_id is None:
+            self._db_terminal_recorded = True
+            return
+        try:
+            if not self._db_production_begun:
+                self.db.begin_production(
+                    self._active_db_run_id,
+                    run_uuid=self._active_run_uuid,
+                    output_file=self.current_raw_file,
+                )
+                self._db_production_begun = True
+            self.db.finalize_production_run(
+                self._active_db_run_id,
+                status=status,
+                exit_code=exit_code,
+                summary_dict=self.last_stats or None,
+                root_file=root_file,
+                error_message=error_message,
+                run_uuid=self._active_run_uuid,
+                output_file=self.current_raw_file,
+            )
+            self._db_terminal_recorded = True
+            self.log_console.append(
+                "<span style='color:#6f42c1;'><b>[DB]</b> "
+                f"Production lifecycle recorded: {html.escape(status)}.</span>"
+            )
+        except Exception as db_exc:
+            # Conversion completion and control recovery must not depend on DB
+            # availability. The error remains operator-visible for later repair.
+            self.log_console.append(
+                "<span style='color:red;'>[DB Error] Production 종료 상태를 "
+                f"기록하지 못했습니다: {html.escape(str(db_exc))}</span>"
+            )
 
     @pyqtSlot(int, QProcess.ExitStatus)
     def handle_finished(self, exitCode, exitStatus):
-        self.btn_run.setEnabled(True); self.set_debug_controls_enabled(False)
-        if exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0:
-            self.log_console.append(f"<span style='color:#5cb85c;'><b>[System] Conversion Successfully Finished!</b></span>")
-            if self.current_raw_file and self.last_stats:
-                self.db.update_production_summary(self.current_raw_file, self.last_stats)
-                self.log_console.append("<span style='color:#6f42c1;'><b>[DB] Production Summary pushed to database.</b></span>")
+        if not self._run_active:
+            return
+        self._stop_grace_timer.stop()
+        self.handle_stdout()
+        if self._stdout_buffer:
+            self.log_console.append(html.escape(self._stdout_buffer))
+            self._stdout_buffer = ""
+        self.handle_stderr()
+        self._consume_stderr(final=True)
+        self._run_active = False
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop Conversion")
+        self.set_debug_controls_enabled(False)
+        process_succeeded = (
+            exitStatus == QProcess.ExitStatus.NormalExit and exitCode == 0
+        )
+        debug_mode = self._active_debug_mode
+        root_identity = None
+        root_identity_error = None
+        if not debug_mode and self.current_root_output:
+            try:
+                root_identity = file_identity(self.current_root_output)
+            except OSError as exc:
+                root_identity_error = str(exc)
+
+        completed_output_truth = bool(
+            not debug_mode and process_succeeded and root_identity is not None
+        )
+        if debug_mode:
+            # Interactive inspection is not a production conversion and must
+            # never advance the durable production lifecycle.
+            self._record_production_terminal(
+                "production_cancelled" if self._cancel_requested
+                else "production_failed",
+                exitCode,
+                error_message="interactive debug session only",
+            )
+            if process_succeeded and not self._cancel_requested:
+                self.progress_bar.setFormat("Debug session ended")
+                self.log_console.append(
+                    "<span style='color:#6f42c1;'><b>[System]</b> Interactive "
+                    "debug session ended; no production ROOT completion was "
+                    "recorded.</span>"
+                )
+            elif self._cancel_requested:
+                self.progress_bar.setFormat("Debug cancelled")
+                self.log_console.append(
+                    "<span style='color:#b45309;'><b>[System]</b> Interactive "
+                    "debug session cancelled.</span>"
+                )
+            else:
+                self.progress_bar.setFormat(f"Debug failed (exit {exitCode})")
+                self.log_console.append(
+                    "<span style='color:red;'><b>[System]</b> Interactive "
+                    f"debug exited with code {exitCode}.</span>"
+                )
+            self._active_debug_mode = False
+            self._sync_busy_controls()
+            return
+
+        # A validated, newly-created ROOT output is stronger completion truth
+        # than a Stop click racing with natural converter completion.
+        if completed_output_truth:
+            db_status = "production_completed"
+        elif self._cancel_requested:
+            db_status = "production_cancelled"
         else:
-            self.log_console.append(f"<span style='color:red;'><b>[System] Conversion Exited with Code: {exitCode}</b></span>")
+            db_status = "production_failed"
+        if completed_output_truth:
+            self.last_stats.update({
+                "root_sha256": root_identity["sha256"],
+                "root_size_bytes": root_identity["size"],
+            })
+        terminal_error = None
+        if db_status != "production_completed":
+            if root_identity_error:
+                terminal_error = (
+                    "production output is missing/unreadable: "
+                    + root_identity_error
+                )
+            elif self._cancel_requested:
+                terminal_error = (
+                    "conversion interrupted by operator; no validated "
+                    "completed ROOT output"
+                )
+            else:
+                terminal_error = f"production exit code {exitCode}"
+        self._record_production_terminal(
+            db_status,
+            exitCode,
+            root_file=(self.current_root_output if completed_output_truth else None),
+            error_message=terminal_error,
+        )
+
+        if completed_output_truth:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("Completed")
+            self.log_console.append(
+                "<span style='color:#5cb85c;'><b>[System] Conversion "
+                "Successfully Finished with identity-validated ROOT output!"
+                "</b></span>"
+            )
+            if self._cancel_requested:
+                self.log_console.append(
+                    "<span style='color:#17a2b8;'>[Lifecycle] Stop intent raced "
+                    "with completion; validated output truth takes "
+                    "precedence.</span>"
+                )
+            self.rootOutputReady.emit(os.path.abspath(self.current_root_output))
+            self.log_console.append(
+                "<span style='color:#17a2b8;'><b>[Validation]</b> "
+                "완성된 ROOT 파일을 검증 탭에 전달했습니다.</span>"
+            )
+        else:
+            status_text = "Cancelled" if self._cancel_requested else "Failed"
+            self.progress_bar.setFormat(f"{status_text} (exit {exitCode})")
+            self.log_console.append(
+                "<span style='color:red;'><b>[System] Conversion Exited with "
+                f"Code: {exitCode}; no validated completed ROOT output was "
+                "published.</b></span>"
+            )
+        self._active_debug_mode = False
+        self.batch.complete_current(
+            "Succeeded" if completed_output_truth else
+            "Cancelled" if self._cancel_requested else "Failed",
+            "Completed" if completed_output_truth else
+            (terminal_error or "Conversion failed") + "\n" + self._stderr_history,
+        )
+        self._sync_busy_controls()

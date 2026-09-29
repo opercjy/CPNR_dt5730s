@@ -1,180 +1,3038 @@
 #include "DAQManager.h"
+#include "DataQuality.h"
+#include "DT5730Constraints.h"
+#include "DT5730Status.h"
+#include "DT5730Timing.h"
+#include "Sha256.h"
 #include "EventHeader.h"
+#include "TriggerCalibration.h"
 #include "CAENComm.h" 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iomanip>
-#include <ctime>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <stdexcept>
 #include <thread>
+#include <ctime>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <zmq.h>
+
+namespace {
+
+constexpr uint32_t kGlobalTriggerMaskRegister = 0x810C;
+constexpr uint32_t kPairTriggerLogicBase = 0x1084;
+constexpr uint32_t kPairRegisterStride = 0x200;
+constexpr uint32_t kInputRangeBase = 0x1028;
+constexpr uint32_t kChannelStatusBase = 0x1088;
+constexpr uint32_t kChannelRegisterStride = 0x100;
+constexpr uint32_t kInputRangeMask = 0x1;
+constexpr uint32_t kDCOffsetDacBusyMask = 1U << 2;
+constexpr uint32_t kPairTriggerRequestMask = 0x0F;
+constexpr uint32_t kPairLogicFieldMask = 0x07;
+constexpr uint32_t kMajorityLevelMask = 0x07U << 24;
+constexpr uint32_t kExternalTriggerEnableMask = 1U << 30;
+constexpr uint32_t kSoftwareTriggerEnableMask = 1U << 31;
+constexpr uint32_t kExternalClockSelectMask = 1U << 6;
+constexpr int kDppFirmwareMajorBase = 128;
+constexpr uint64_t kZmqQueueByteBudget = 64U * 1024U * 1024U;
+constexpr uint32_t kZmqMaximumHwmMessages = 5000U;
+constexpr uint32_t kMaximumDCOffsetDac = 65535U;
+constexpr int64_t kMaximumDCOffsetAdjustmentStep = 16384;
+
+class FatalAcquisitionError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+struct FileIdentity {
+  uint64_t device = 0;
+  uint64_t inode = 0;
+};
+
+std::string Hex32(uint32_t value) {
+  std::ostringstream stream;
+  stream << "0x" << std::uppercase << std::hex << std::setw(8)
+         << std::setfill('0') << value;
+  return stream.str();
+}
+
+void VerifyCaenStandardEventHeader(const char* event_pointer,
+                                   uint32_t event_size,
+                                   const char* readout_block,
+                                   uint32_t readout_block_size,
+                                   uint32_t event_index,
+                                   uint32_t event_count,
+                                   const std::string& context) {
+  const auto base = reinterpret_cast<std::uintptr_t>(readout_block);
+  const auto pointer = reinterpret_cast<std::uintptr_t>(event_pointer);
+  const bool within_block = event_pointer && readout_block && pointer >= base &&
+                           pointer - base < readout_block_size;
+  const auto offset = within_block ? pointer - base : 0U;
+  const auto detail = [&]() {
+    std::ostringstream out;
+    out << " [event_index=" << event_index << "/" << event_count
+        << ", event_bytes=" << event_size
+        << ", block_bytes=" << readout_block_size << ", event_offset=";
+    if (within_block) out << offset;
+    else out << "outside_block";
+    if (within_block) {
+      out << ", header_words=";
+      const auto bytes = std::min<std::size_t>(16, readout_block_size - offset);
+      for (std::size_t i = 0; i + 4 <= bytes; i += 4) {
+        uint32_t word = 0;
+        std::memcpy(&word, event_pointer + i, sizeof(word));
+        if (i) out << ",";
+        out << Hex32(word);
+      }
+    }
+    out << "]";
+    return out.str();
+  };
+  if (event_pointer == nullptr) {
+    throw FatalAcquisitionError(
+        context + " event lookup returned a null event pointer" + detail());
+  }
+  if (event_size > readout_block_size) {
+    throw FatalAcquisitionError(
+        context + " event metadata reports a size larger than its readout "
+                  "block" + detail());
+  }
+  if (!within_block || event_size > readout_block_size - offset) {
+    throw FatalAcquisitionError(
+        context + " event extends outside its readout block" + detail());
+  }
+  uint32_t raw_second_word = 0U;
+  const auto quality = cpnr::InspectCaenEventHeader(
+      event_pointer, event_size, &raw_second_word);
+  if (quality == cpnr::CaenEventHeaderQuality::kTruncated) {
+    throw FatalAcquisitionError(
+        context + " event is truncated before the complete four-word "
+                  "standard header" + detail());
+  }
+  if (quality == cpnr::CaenEventHeaderQuality::kMalformed) {
+    throw FatalAcquisitionError(
+        context + " event header tag/size does not match standard waveform "
+                  "framing" + detail());
+  }
+  if (quality == cpnr::CaenEventHeaderQuality::kBoardFailure) {
+    throw FatalAcquisitionError(
+        context + " raw event header asserted Board Fail in word 1 " +
+        Hex32(raw_second_word) +
+        "; refusing data from a hardware-fault event");
+  }
+}
+
+std::string AbsolutePath(const std::string& path) {
+  if (path.empty()) return {};
+  return std::filesystem::absolute(std::filesystem::path(path))
+      .lexically_normal().string();
+}
+
+std::string ReadRequiredTextFile(const std::string& path,
+                                 const std::string& description) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    throw std::runtime_error("Cannot open " + description + ": " + path);
+  }
+  std::ostringstream contents;
+  contents << input.rdbuf();
+  if (input.bad()) {
+    throw std::runtime_error("Cannot read " + description + ": " + path);
+  }
+  const std::string result = contents.str();
+  if (result.empty()) {
+    throw std::runtime_error(description + " is empty: " + path);
+  }
+  return result;
+}
+
+std::string RequireAbsentFile(const std::string& path,
+                              const std::string& description) {
+  const std::string absolute = AbsolutePath(path);
+  if (absolute.empty()) {
+    throw std::runtime_error(description + " path cannot be empty");
+  }
+  std::error_code status_error;
+  const auto status = std::filesystem::symlink_status(absolute, status_error);
+  if (status_error &&
+      status_error != std::errc::no_such_file_or_directory) {
+    throw std::runtime_error("Cannot inspect " + description + " path " +
+                             absolute + ": " + status_error.message());
+  }
+  if (!status_error &&
+      status.type() != std::filesystem::file_type::not_found) {
+    throw std::runtime_error(
+        description + " already exists; refusing to overwrite: " + absolute);
+  }
+  return absolute;
+}
+
+uint32_t EnabledChannelCount(uint32_t mask) {
+  uint32_t count = 0U;
+  while (mask != 0U) {
+    count += mask & 1U;
+    mask >>= 1U;
+  }
+  return count;
+}
+
+uint64_t RawEventBytes(const DAQHardwareSettings& settings) {
+  const uint64_t waveform_bytes =
+      static_cast<uint64_t>(EnabledChannelCount(settings.channel_mask)) *
+      settings.record_length * sizeof(uint16_t);
+  if (waveform_bytes >
+      std::numeric_limits<uint64_t>::max() - sizeof(EventHeader)) {
+    throw std::runtime_error("Configured raw event size overflows uint64_t");
+  }
+  return sizeof(EventHeader) + waveform_bytes;
+}
+
+std::filesystem::path OutputParent(const std::string& path) {
+  const auto parent = std::filesystem::path(path).parent_path();
+  return parent.empty() ? std::filesystem::path(".") : parent;
+}
+
+uint64_t FilesystemFreeBytes(const std::string& output_path) {
+  const auto parent = OutputParent(output_path);
+  struct statvfs filesystem {};
+  if (::statvfs(parent.c_str(), &filesystem) != 0) {
+    throw std::runtime_error(
+        "Cannot inspect free space on output filesystem " +
+        parent.string() + " (" + std::strerror(errno) + ")");
+  }
+  if (filesystem.f_frsize != 0U &&
+      static_cast<uint64_t>(filesystem.f_bavail) >
+          std::numeric_limits<uint64_t>::max() /
+              static_cast<uint64_t>(filesystem.f_frsize)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return static_cast<uint64_t>(filesystem.f_bavail) *
+         static_cast<uint64_t>(filesystem.f_frsize);
+}
+
+uint64_t ExpectedRawBytes(const DAQHardwareSettings& settings,
+                          int max_events) {
+  if (max_events <= 0) return 0U;
+  const uint64_t event_bytes = RawEventBytes(settings);
+  if (static_cast<uint64_t>(max_events) >
+      std::numeric_limits<uint64_t>::max() / event_bytes) {
+    throw std::runtime_error("Requested event count overflows raw size estimate");
+  }
+  return event_bytes * static_cast<uint64_t>(max_events);
+}
+
+std::string PrepareWorkingOutputPath(
+    const std::string& final_output, const DAQHardwareSettings& settings,
+    int max_events, int run_time_sec) {
+  if (max_events < 0 || run_time_sec < 0) {
+    throw std::runtime_error("Event and time limits cannot be negative");
+  }
+  if (max_events > 0 && run_time_sec > 0) {
+    throw std::runtime_error(
+        "Event and time limits are mutually exclusive");
+  }
+  const std::string working =
+      RequireAbsentFile(final_output + ".partial", "Raw partial output");
+  const uint64_t available = FilesystemFreeBytes(working);
+  const uint64_t expected = ExpectedRawBytes(settings, max_events);
+  const uint64_t reserve = settings.storage.minimum_free_bytes;
+  if (available < reserve || expected > available - reserve) {
+    std::ostringstream message;
+    message << "Insufficient output-filesystem capacity: available="
+            << available << " bytes, expected_raw=" << expected
+            << " bytes, required_reserve=" << reserve << " bytes";
+    throw std::runtime_error(message.str());
+  }
+  return working;
+}
+
+std::string MetadataOutputPath(const std::string& output_file,
+                               const std::string& metadata_file) {
+  const std::string final_path = RequireAbsentFile(
+      metadata_file.empty() ? AbsolutePath(output_file) + ".run.json"
+                            : metadata_file,
+      "Runtime metadata");
+  RequireAbsentFile(
+      final_path + ".status.hardware_verified_not_started.json",
+      "Hardware-verified runtime status");
+  RequireAbsentFile(final_path + ".status.running.json",
+                    "Running runtime status");
+  return final_path;
+}
+
+std::string ConfigSnapshotPath(const std::string& config_file,
+                               const std::string& output_file) {
+  const std::string snapshot = AbsolutePath(output_file) + ".config.conf";
+  if (AbsolutePath(config_file) == snapshot) return snapshot;
+  return RequireAbsentFile(snapshot, "Runtime config snapshot");
+}
+
+std::string ConfigSnapshotPathAndValidateArtifacts(
+    const std::string& config_file, const std::string& output_file,
+    const std::string& working_output_file,
+    const std::string& metadata_file) {
+  const std::string snapshot =
+      ConfigSnapshotPath(config_file, output_file);
+  const std::array<std::pair<const char*, std::string>, 6> artifacts{{
+      {"raw output", output_file},
+      {"partial raw output", working_output_file},
+      {"runtime metadata", metadata_file},
+      {"runtime config snapshot", snapshot},
+      {"hardware-verified status",
+       metadata_file + ".status.hardware_verified_not_started.json"},
+      {"running status", metadata_file + ".status.running.json"},
+  }};
+
+  struct TargetKey {
+    uint64_t parent_device = 0;
+    uint64_t parent_inode = 0;
+    std::string filename;
+  };
+  const auto target_key = [](const std::string& target) {
+    const std::filesystem::path path(target);
+    const std::filesystem::path parent = path.parent_path().empty()
+                                             ? std::filesystem::path(".")
+                                             : path.parent_path();
+    const int descriptor =
+        ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0) {
+      throw std::runtime_error(
+          "Cannot open runtime artifact directory " + parent.string() +
+          " (" + std::strerror(errno) + ")");
+    }
+    struct stat status {};
+    const int stat_result = ::fstat(descriptor, &status);
+    const int stat_error = errno;
+    ::close(descriptor);
+    if (stat_result != 0 || !S_ISDIR(status.st_mode)) {
+      throw std::runtime_error(
+          "Cannot identify runtime artifact directory " + parent.string() +
+          " (" + std::strerror(stat_error) + ")");
+    }
+    return TargetKey{static_cast<uint64_t>(status.st_dev),
+                     static_cast<uint64_t>(status.st_ino),
+                     path.filename().string()};
+  };
+  std::array<TargetKey, 6> keys;
+  for (std::size_t index = 0; index < artifacts.size(); ++index) {
+    keys[index] = target_key(artifacts[index].second);
+  }
+  for (std::size_t left = 0; left < artifacts.size(); ++left) {
+    for (std::size_t right = left + 1U; right < artifacts.size(); ++right) {
+      if (keys[left].parent_device == keys[right].parent_device &&
+          keys[left].parent_inode == keys[right].parent_inode &&
+          keys[left].filename == keys[right].filename) {
+        throw std::runtime_error(
+            "Runtime artifact paths alias: " +
+            std::string(artifacts[left].first) + " and " +
+            artifacts[right].first + " both resolve to " +
+            artifacts[left].second);
+      }
+    }
+  }
+  return snapshot;
+}
+
+std::pair<int, FileIdentity> ReserveOutputFile(
+    const std::string& output_file) {
+  const int descriptor =
+      ::open(output_file.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+        "Cannot create raw output without overwriting an existing file: " +
+        output_file + " (" + std::strerror(errno) + ")");
+  }
+  struct stat status {};
+  if (::fstat(descriptor, &status) != 0) {
+    const int status_error = errno;
+    ::close(descriptor);
+    throw std::runtime_error("Cannot identify newly reserved raw output " +
+                             output_file + " (" +
+                             std::strerror(status_error) +
+                             "); preserving the path because its identity "
+                             "could not be established");
+  }
+  return {descriptor,
+          {static_cast<uint64_t>(status.st_dev),
+           static_cast<uint64_t>(status.st_ino)}};
+}
+
+bool PathMatchesIdentity(const std::string& path,
+                         const FileIdentity& identity) {
+  struct stat status {};
+  return ::lstat(path.c_str(), &status) == 0 &&
+         static_cast<uint64_t>(status.st_dev) == identity.device &&
+         static_cast<uint64_t>(status.st_ino) == identity.inode;
+}
+
+int RenameNoReplace(int old_directory, const char* old_path,
+                    int new_directory, const char* new_path) {
+#ifdef SYS_renameat2
+  constexpr unsigned int kRenameNoReplace = 1U;
+  return static_cast<int>(::syscall(SYS_renameat2, old_directory, old_path,
+                                    new_directory, new_path,
+                                    kRenameNoReplace));
+#else
+  (void)old_directory;
+  (void)old_path;
+  (void)new_directory;
+  (void)new_path;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+bool RemoveIfSameFile(const std::string& path,
+                      const FileIdentity& identity) {
+  // There is no POSIX unlink-by-inode operation.  Checking with lstat() and
+  // then unlinking the public pathname is unsafe because another process can
+  // replace the name between those calls.  Instead, atomically move whichever
+  // entry currently owns the public name into a freshly-created quarantine,
+  // inspect it through the pinned directory descriptor, and delete it only
+  // after the inode matches.  A mismatching entry is restored without
+  // overwrite; if the public name was concurrently reused, preserve the entry
+  // in quarantine rather than deleting either file.
+  const auto target_path = std::filesystem::path(path);
+  const auto parent = target_path.parent_path().empty()
+                          ? std::filesystem::path(".")
+                          : target_path.parent_path();
+  std::string quarantine_template =
+      (parent / ".cpnr-cleanup-XXXXXX").string();
+  std::vector<char> quarantine_buffer(quarantine_template.begin(),
+                                      quarantine_template.end());
+  quarantine_buffer.push_back('\0');
+  char* const quarantine_created = ::mkdtemp(quarantine_buffer.data());
+  if (quarantine_created == nullptr) return false;
+  const std::string quarantine_path(quarantine_created);
+
+  const int quarantine_descriptor =
+      ::open(quarantine_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (quarantine_descriptor < 0) {
+    ::rmdir(quarantine_path.c_str());
+    return false;
+  }
+
+  constexpr const char* kQuarantinedEntry = "candidate";
+  const auto close_empty_quarantine = [&]() {
+    ::close(quarantine_descriptor);
+    if (::rmdir(quarantine_path.c_str()) != 0 && errno != ENOENT) {
+      std::cerr << "[Run Provenance] Cannot remove empty cleanup quarantine: "
+                << quarantine_path << " (" << std::strerror(errno) << ")\n";
+    }
+  };
+  const auto preserve_or_restore = [&]() {
+    if (RenameNoReplace(quarantine_descriptor, kQuarantinedEntry, AT_FDCWD,
+                        path.c_str()) == 0) {
+      close_empty_quarantine();
+      return;
+    }
+    const int restore_error = errno;
+    ::close(quarantine_descriptor);
+    std::cerr << "[Run Provenance] Preserved a cleanup-race entry in "
+              << quarantine_path << "/" << kQuarantinedEntry
+              << " because its public name could not be restored without "
+                 "overwrite: "
+              << path << " (" << std::strerror(restore_error) << ")\n";
+  };
+
+  if (RenameNoReplace(AT_FDCWD, path.c_str(), quarantine_descriptor,
+                      kQuarantinedEntry) != 0) {
+    close_empty_quarantine();
+    return false;
+  }
+
+  struct stat quarantined_status {};
+  if (::fstatat(quarantine_descriptor, kQuarantinedEntry,
+                &quarantined_status, AT_SYMLINK_NOFOLLOW) != 0) {
+    preserve_or_restore();
+    return false;
+  }
+  const bool identity_matches =
+      static_cast<uint64_t>(quarantined_status.st_dev) == identity.device &&
+      static_cast<uint64_t>(quarantined_status.st_ino) == identity.inode;
+  if (!identity_matches) {
+    preserve_or_restore();
+    return false;
+  }
+
+  if (::unlinkat(quarantine_descriptor, kQuarantinedEntry, 0) != 0) {
+    preserve_or_restore();
+    return false;
+  }
+  close_empty_quarantine();
+  return true;
+}
+
+void LinkDescriptorNoReplace(int descriptor, const std::string& target,
+                             const std::string& description) {
+  // Bind the destination to the already-open inode.  Publishing by pathname
+  // here would allow a concurrent pathname replacement after fsync.
+  constexpr int kAtEmptyPath = 0x1000;
+  if (::linkat(descriptor, "", AT_FDCWD, target.c_str(), kAtEmptyPath) == 0) {
+    return;
+  }
+  const int descriptor_link_error = errno;
+
+  const std::string descriptor_path =
+      "/proc/self/fd/" + std::to_string(descriptor);
+  if (::linkat(AT_FDCWD, descriptor_path.c_str(), AT_FDCWD, target.c_str(),
+               AT_SYMLINK_FOLLOW) == 0) {
+    return;
+  }
+  const int proc_link_error = errno;
+  throw std::runtime_error(
+      "Cannot publish " + description + " without overwrite: " + target +
+      " (descriptor link: " + std::strerror(descriptor_link_error) +
+      ", /proc fallback: " + std::strerror(proc_link_error) + ")");
+}
+
+void WriteAll(int descriptor, const std::string& contents,
+              const std::string& description) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const ssize_t written = ::write(descriptor, contents.data() + offset,
+                                    contents.size() - offset);
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) {
+      throw std::runtime_error("Cannot write " + description + " (" +
+                               std::strerror(errno) + ")");
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+}
+
+void SyncParentDirectory(const std::string& path) {
+  const std::filesystem::path parent =
+      std::filesystem::path(path).parent_path().empty()
+          ? std::filesystem::path(".")
+          : std::filesystem::path(path).parent_path();
+  const int descriptor =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+        "Cannot open runtime artifact directory for sync: " +
+        parent.string() + " (" + std::strerror(errno) + ")");
+  }
+  const int result = ::fsync(descriptor);
+  const int sync_error = errno;
+  ::close(descriptor);
+  if (result != 0) {
+    throw std::runtime_error(
+        "Cannot sync runtime artifact directory: " + parent.string() +
+        " (" + std::strerror(sync_error) + ")");
+  }
+}
+
+FileIdentity WriteNewAtomicFile(const std::string& target,
+                                const std::string& contents) {
+  std::string template_path = target + ".tmp.XXXXXX";
+  std::vector<char> template_buffer(template_path.begin(), template_path.end());
+  template_buffer.push_back('\0');
+  const int descriptor = ::mkstemp(template_buffer.data());
+  if (descriptor < 0) {
+    throw std::runtime_error("Cannot create temporary file beside " + target +
+                             " (" + std::strerror(errno) + ")");
+  }
+  const std::string temporary_path(template_buffer.data());
+  struct stat temporary_status {};
+  if (::fstat(descriptor, &temporary_status) != 0) {
+    const int status_error = errno;
+    ::close(descriptor);
+    throw std::runtime_error(
+        "Cannot identify temporary runtime artifact " + temporary_path +
+        " (" + std::strerror(status_error) +
+        "); preserving it because its identity could not be established");
+  }
+  const FileIdentity temporary_identity{
+      static_cast<uint64_t>(temporary_status.st_dev),
+      static_cast<uint64_t>(temporary_status.st_ino)};
+  bool descriptor_open = true;
+  bool target_link_created = false;
+  try {
+    if (::fchmod(descriptor, 0644) != 0) {
+      throw std::runtime_error("Cannot set permissions on " + temporary_path);
+    }
+    WriteAll(descriptor, contents, "temporary runtime artifact");
+    if (::fsync(descriptor) != 0) {
+      throw std::runtime_error("Cannot sync temporary runtime artifact " +
+                               temporary_path + " (" +
+                               std::strerror(errno) + ")");
+    }
+    if (!PathMatchesIdentity(temporary_path, temporary_identity)) {
+      throw std::runtime_error(
+          "Temporary runtime artifact inode changed before publication: " +
+          temporary_path);
+    }
+
+    LinkDescriptorNoReplace(descriptor, target, "runtime artifact");
+    target_link_created = true;
+    if (!PathMatchesIdentity(target, temporary_identity)) {
+      throw std::runtime_error(
+          "Published runtime artifact inode does not match the validated "
+          "descriptor: " + target);
+    }
+
+    try {
+      SyncParentDirectory(target);
+    } catch (...) {
+      if (RemoveIfSameFile(target, temporary_identity)) {
+        try {
+          SyncParentDirectory(target);
+        } catch (...) {
+          // Preserve the original durability failure.
+        }
+      }
+      throw;
+    }
+    if (!PathMatchesIdentity(target, temporary_identity)) {
+      throw std::runtime_error(
+          "Published runtime artifact identity changed during durable "
+          "commit: " + target);
+    }
+
+    if (::close(descriptor) != 0) {
+      std::cerr << "[Run Provenance] Published artifact is durable, but "
+                   "closing its temporary descriptor failed: "
+                << std::strerror(errno) << "\n";
+    }
+    descriptor_open = false;
+
+    if (!RemoveIfSameFile(temporary_path, temporary_identity)) {
+      std::cerr << "[Run Provenance] Published artifact is durable, but "
+                   "temporary-name cleanup was unsafe or failed: "
+                << temporary_path << "\n";
+    } else {
+      try {
+        SyncParentDirectory(target);
+      } catch (const std::exception& error) {
+        std::cerr << "[Run Provenance] Published artifact is durable, but "
+                     "temporary-name cleanup sync failed: "
+                  << error.what() << "\n";
+      }
+    }
+    return temporary_identity;
+  } catch (...) {
+    if (descriptor_open) ::close(descriptor);
+    RemoveIfSameFile(temporary_path, temporary_identity);
+    if (target_link_created) {
+      RemoveIfSameFile(target, temporary_identity);
+    }
+    throw;
+  }
+}
+
+int PositiveRunNumber(int run_number) {
+  if (run_number <= 0) {
+    throw std::runtime_error("Run number must be a positive integer");
+  }
+  return run_number;
+}
+
+std::string JsonEscape(const std::string& value) {
+  std::ostringstream escaped;
+  for (const unsigned char character : value) {
+    switch (character) {
+      case '\"': escaped << "\\\""; break;
+      case '\\': escaped << "\\\\"; break;
+      case '\b': escaped << "\\b"; break;
+      case '\f': escaped << "\\f"; break;
+      case '\n': escaped << "\\n"; break;
+      case '\r': escaped << "\\r"; break;
+      case '\t': escaped << "\\t"; break;
+      default:
+        if (character < 0x20) {
+          escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                  << static_cast<unsigned int>(character) << std::dec;
+        } else {
+          escaped << character;
+        }
+    }
+  }
+  return escaped.str();
+}
+
+double HistogramMedian(const std::vector<uint64_t>& histogram) {
+  const uint64_t sample_count =
+      std::accumulate(histogram.begin(), histogram.end(), uint64_t{0});
+  if (sample_count == 0U) {
+    throw std::runtime_error(
+        "Cannot calculate a baseline from zero ADC samples");
+  }
+  const uint64_t lower_rank = (sample_count - 1U) / 2U;
+  const uint64_t upper_rank = sample_count / 2U;
+  uint64_t cumulative = 0U;
+  uint32_t lower_value = 0U;
+  uint32_t upper_value = 0U;
+  bool lower_found = false;
+  for (std::size_t code = 0; code < histogram.size(); ++code) {
+    cumulative += histogram[code];
+    if (!lower_found && cumulative > lower_rank) {
+      lower_value = static_cast<uint32_t>(code);
+      lower_found = true;
+    }
+    if (cumulative > upper_rank) {
+      upper_value = static_cast<uint32_t>(code);
+      break;
+    }
+  }
+  return (static_cast<double>(lower_value) +
+          static_cast<double>(upper_value)) /
+         2.0;
+}
+
+int ParseFirmwareMajor(const char* release) {
+  std::istringstream stream(release);
+  int major = -1;
+  stream >> major;
+  if (!stream || major < 0) {
+    throw std::runtime_error(
+        "Cannot identify AMC firmware revision '" + std::string(release) +
+        "'; explicit trigger-register routing was not applied");
+  }
+  return major;
+}
+
+uint32_t ReadRegister(int handle, uint32_t address) {
+  uint32_t value = 0;
+  CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, address, &value));
+  return value;
+}
+
+void WriteMaskedRegisterAndVerify(int handle, uint32_t address, uint32_t mask,
+                                  uint32_t requested_value,
+                                  const std::string& description) {
+  const uint32_t current_value = ReadRegister(handle, address);
+  const uint32_t updated_value =
+      (current_value & ~mask) | (requested_value & mask);
+  CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, address, updated_value));
+
+  const uint32_t readback = ReadRegister(handle, address);
+  if ((readback & mask) != (requested_value & mask)) {
+    throw std::runtime_error(
+        description + " register verification failed at " + Hex32(address) +
+        ": requested " + Hex32(requested_value & mask) + ", read " +
+        Hex32(readback & mask));
+  }
+}
+
+uint32_t PairRequestMask(uint32_t self_trigger_mask) {
+  uint32_t request_mask = 0;
+  for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+    if ((self_trigger_mask & (0x3U << (pair * 2))) != 0U) {
+      request_mask |= 1U << pair;
+    }
+  }
+  return request_mask;
+}
+
+std::string DescribeTriggerRouting(uint32_t self_trigger_mask,
+                                   DAQPairLogic pair_logic) {
+  std::ostringstream description;
+  bool first = true;
+  for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+    const int even_ch = pair * 2;
+    const uint32_t pair_bits = (self_trigger_mask >> even_ch) & 0x3U;
+    if (pair_bits == 0U) continue;
+
+    if (!first) description << " OR ";
+    first = false;
+    if (pair_bits == 0x1U) {
+      description << "CH" << even_ch;
+    } else if (pair_bits == 0x2U) {
+      description << "CH" << even_ch + 1;
+    } else {
+      description << "(CH" << even_ch
+                  << (pair_logic == DAQPairLogic::kAnd ? " AND CH" : " OR CH")
+                  << even_ch + 1 << ")";
+    }
+  }
+  return description.str();
+}
+
+uint64_t MakeRandomTriggerSeed(int run_number) {
+  const auto steady_ticks = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto system_ticks = static_cast<uint64_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  uint64_t seed = steady_ticks ^ (system_ticks + 0x9E3779B97F4A7C15ULL) ^
+                  (static_cast<uint64_t>(static_cast<uint32_t>(run_number))
+                   << 32U) ^
+                  static_cast<uint64_t>(::getpid());
+  try {
+    std::random_device entropy;
+    seed ^= (static_cast<uint64_t>(entropy()) << 32U) ^ entropy();
+  } catch (...) {
+    // Clock, PID, and run identity still provide a run-specific fallback on
+    // platforms where std::random_device is unavailable.
+  }
+  return seed != 0U ? seed : 0xD1B54A32D192ED03ULL;
+}
+
+}  // namespace
 
 DAQManager::DAQManager(const std::string &config_file,
                        const std::string &output_file, int max_events,
-                       int run_time_sec)
-    : config_(config_file), output_file_(output_file), max_events_(max_events),
+                       int run_time_sec, int run_number,
+                       const std::string &metadata_file,
+                       const std::string &executable_path,
+                       const std::string &git_commit,
+                       const std::string &build_timestamp,
+                       const std::atomic<bool> *cancellation_flag)
+    : config_file_(AbsolutePath(config_file)),
+      config_contents_(ReadRequiredTextFile(config_file_, "DAQ config")),
+      config_(ConfigParser::FromText(config_contents_, config_file_)),
+      hardware_settings_(LoadDAQHardwareSettings(config_)),
+      output_file_(RequireAbsentFile(output_file, "Raw output")),
+      working_output_file_(PrepareWorkingOutputPath(
+          output_file_, hardware_settings_, max_events, run_time_sec)),
+      metadata_file_(MetadataOutputPath(output_file, metadata_file)),
+      config_snapshot_file_(ConfigSnapshotPathAndValidateArtifacts(
+          config_file_, output_file_, working_output_file_, metadata_file_)),
+      executable_path_(executable_path.empty() ? "unknown" : executable_path),
+      git_commit_(git_commit), build_timestamp_(build_timestamp),
+      run_number_(PositiveRunNumber(run_number)), max_events_(max_events),
       run_time_sec_(run_time_sec), running_(false),
-      digitizer_(CAEN_DGTZ_USB, 0, 0, 0) {
-        
-  zmq_ctx_ = zmq_ctx_new();
-  zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
-  int hwm = 5000;
-  zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm));
-  
-  int linger = 0;
-  zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger));
-  zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555");
-
-  if (!output_file_.empty()) {
-    static std::vector<char> write_buffer(4 * 1024 * 1024);
-    out_stream_.rdbuf()->pubsetbuf(write_buffer.data(), write_buffer.size());
-    out_stream_.open(output_file_, std::ios::binary);
-    if (!out_stream_.is_open()) {
-      throw std::runtime_error("Cannot open output file: " + output_file_);
-    }
+      cancellation_flag_(cancellation_flag) {
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    software_random_trigger_seed_ = MakeRandomTriggerSeed(run_number_);
   }
-  
-  SetupHardware();
+  expected_raw_bytes_ = ExpectedRawBytes(hardware_settings_, max_events_);
+  output_free_bytes_at_start_ = FilesystemFreeBytes(working_output_file_);
+  std::cout << "\033[1;36m[Storage Preflight]\033[0m filesystem_free="
+            << output_free_bytes_at_start_ << " bytes, expected_raw="
+            << expected_raw_bytes_ << " bytes, reserve="
+            << hardware_settings_.storage.minimum_free_bytes
+            << " bytes, runtime_stop_watermark="
+            << hardware_settings_.storage.stop_free_bytes << " bytes\n";
+  // Hash the inode the kernel is actually executing. Reopening argv[0] can
+  // hash a replacement binary after an in-place rebuild.
+  executable_sha256_ = Sha256FileHex("/proc/self/exe");
+
+  bool output_created = false;
+  int output_descriptor = -1;
+  const auto cleanup_failed_construction = [&]() {
+    if (output_stream_) {
+      ::fclose(output_stream_);
+      output_stream_ = nullptr;
+    } else if (output_descriptor >= 0) {
+      ::close(output_descriptor);
+      output_descriptor = -1;
+    }
+    if (output_created) {
+      RemoveIfSameFile(working_output_file_,
+                       {output_device_, output_inode_});
+    }
+    if (zmq_pub_) zmq_close(zmq_pub_);
+    if (zmq_ctx_) zmq_ctx_destroy(zmq_ctx_);
+    zmq_pub_ = nullptr;
+    zmq_ctx_ = nullptr;
+  };
+  const auto record_failed_setup = [&](const std::string& reason) {
+    acquisition_status_ = "failed";
+    termination_reason_ = "setup_failure";
+    failure_reason_ = reason;
+    acquisition_end_unix_time_ = std::time(nullptr);
+    try {
+      WriteRuntimeArtifacts();
+    } catch (const std::exception& metadata_error) {
+      std::cerr << "[Run Provenance] Cannot record setup failure: "
+                << metadata_error.what() << "\n";
+    }
+  };
+  const auto record_cancelled_setup = [&]() {
+    acquisition_status_ = "cancelled";
+    termination_reason_ = "cancelled_during_setup";
+    failure_reason_.clear();
+    acquisition_end_unix_time_ = std::time(nullptr);
+    WriteRuntimeArtifacts();
+  };
+  try {
+    zmq_ctx_ = zmq_ctx_new();
+    if (!zmq_ctx_) {
+      throw std::runtime_error("Cannot create ZeroMQ context");
+    }
+    zmq_pub_ = zmq_socket(zmq_ctx_, ZMQ_PUB);
+    if (!zmq_pub_) {
+      throw std::runtime_error("Cannot create ZeroMQ publisher socket");
+    }
+    const uint64_t raw_event_bytes = RawEventBytes(hardware_settings_);
+    const uint64_t byte_limited_hwm =
+        std::max<uint64_t>(1U, kZmqQueueByteBudget / raw_event_bytes);
+    zmq_send_hwm_messages_ = static_cast<uint32_t>(
+        std::min<uint64_t>(kZmqMaximumHwmMessages, byte_limited_hwm));
+    zmq_send_hwm_approx_bytes_ =
+        raw_event_bytes * static_cast<uint64_t>(zmq_send_hwm_messages_);
+    const int hwm = static_cast<int>(zmq_send_hwm_messages_);
+    if (zmq_setsockopt(zmq_pub_, ZMQ_SNDHWM, &hwm, sizeof(hwm)) != 0) {
+      throw std::runtime_error(
+          "Cannot configure ZeroMQ send watermark: " +
+          std::string(zmq_strerror(zmq_errno())));
+    }
+    int linger = 0;
+    if (zmq_setsockopt(zmq_pub_, ZMQ_LINGER, &linger, sizeof(linger)) != 0) {
+      throw std::runtime_error("Cannot configure ZeroMQ linger: " +
+                               std::string(zmq_strerror(zmq_errno())));
+    }
+    if (zmq_bind(zmq_pub_, "tcp://127.0.0.1:5555") != 0) {
+      throw std::runtime_error(
+          "Cannot bind ZeroMQ publisher to tcp://127.0.0.1:5555: " +
+          std::string(zmq_strerror(zmq_errno())));
+    }
+    std::cout << "\033[1;36m[ZeroMQ]\033[0m send_hwm="
+              << zmq_send_hwm_messages_ << " messages, approximate_queue="
+              << zmq_send_hwm_approx_bytes_ << "/" << kZmqQueueByteBudget
+              << " bytes\n";
+    digitizer_ = std::make_unique<CaenDigitizer>(
+        CAEN_DGTZ_USB, hardware_settings_.connection.link,
+        hardware_settings_.connection.node,
+        hardware_settings_.connection.base_address);
+    SetupHardware();
+    hardware_verified_unix_time_ = std::time(nullptr);
+    const auto reservation = ReserveOutputFile(working_output_file_);
+    output_descriptor = reservation.first;
+    output_device_ = reservation.second.device;
+    output_inode_ = reservation.second.inode;
+    output_created = true;
+    SyncParentDirectory(working_output_file_);
+    output_stream_ = ::fdopen(output_descriptor, "w+b");
+    if (!output_stream_) {
+      const int stream_error = errno;
+      ::close(output_descriptor);
+      output_descriptor = -1;
+      throw std::runtime_error("Cannot attach a stream to reserved output " +
+                               working_output_file_ + " (" +
+                               std::strerror(stream_error) + ")");
+    }
+    output_descriptor = -1;
+    output_write_buffer_.resize(4 * 1024 * 1024);
+    if (::setvbuf(output_stream_, output_write_buffer_.data(), _IOFBF,
+                  output_write_buffer_.size()) != 0) {
+      throw std::runtime_error("Cannot configure raw-output write buffer");
+    }
+    WriteRuntimeArtifacts();
+  } catch (const DAQSetupCancelled&) {
+    try {
+      record_cancelled_setup();
+    } catch (const std::exception& metadata_error) {
+      cleanup_failed_construction();
+      throw std::runtime_error(
+          "Hardware setup was cancelled, but terminal metadata could not be "
+          "recorded: " + std::string(metadata_error.what()));
+    } catch (...) {
+      cleanup_failed_construction();
+      throw std::runtime_error(
+          "Hardware setup was cancelled, but terminal metadata failed with "
+          "an unknown non-standard exception");
+    }
+    cleanup_failed_construction();
+    throw;
+  } catch (const std::exception& error) {
+    record_failed_setup(error.what());
+    cleanup_failed_construction();
+    throw;
+  } catch (...) {
+    record_failed_setup("unknown non-standard setup exception");
+    cleanup_failed_construction();
+    throw;
+  }
 }
 
 DAQManager::~DAQManager() {
   Stop();
-  if (out_stream_.is_open()) out_stream_.close();
-  zmq_close(zmq_pub_);
-  zmq_ctx_destroy(zmq_ctx_);
+  if (output_stream_) {
+    ::fclose(output_stream_);
+    output_stream_ = nullptr;
+  }
+  if (zmq_pub_) zmq_close(zmq_pub_);
+  if (zmq_ctx_) zmq_ctx_destroy(zmq_ctx_);
 }
 
 void DAQManager::SetupHardware() {
+  CheckSetupCancellation();
   std::cout << "\033[1;36m[DAQManager]\033[0m Configuring Hardware from Config...\n";
-  int handle = digitizer_.GetHandle();
-  
+  if (!digitizer_) {
+    throw std::logic_error("DAQ hardware object is not initialized");
+  }
+  const int handle = digitizer_->GetHandle();
+
+  const auto validate_identity = [&](const CAEN_DGTZ_BoardInfo_t& info,
+                                     const char* phase) {
+    const std::string model = info.ModelName;
+    const std::string expected_model =
+        hardware_settings_.connection.expected_model;
+    if (model.rfind(expected_model, 0U) != 0U) {
+      throw std::runtime_error(
+          std::string("Connected-board model mismatch ") + phase +
+          ": expected prefix '" + expected_model + "', observed '" + model +
+          "'");
+    }
+    if (hardware_settings_.connection.has_expected_serial &&
+        info.SerialNumber != hardware_settings_.connection.expected_serial) {
+      throw std::runtime_error(
+          std::string("Connected-board serial mismatch ") + phase +
+          ": expected " +
+          std::to_string(hardware_settings_.connection.expected_serial) +
+          ", observed " + std::to_string(info.SerialNumber));
+    }
+    if (info.FamilyCode != CAEN_DGTZ_XX730_FAMILY_CODE) {
+      throw std::runtime_error(
+          std::string("Input-range and trigger calibration require an x730-family digitizer ") +
+          phase + "; connected model is " + model);
+    }
+    if (ParseFirmwareMajor(info.AMC_FirmwareRel) >=
+        kDppFirmwareMajorBase) {
+      throw std::runtime_error(
+          std::string("This acquisition path requires standard waveform firmware ") +
+          phase + "; connected AMC firmware is " +
+          std::string(info.AMC_FirmwareRel) + " (DPP family)");
+    }
+    if (info.ADC_NBits != hardware_settings_.adc_bits) {
+      throw std::runtime_error(
+          std::string("Board ADC resolution does not match config ") + phase +
+          ": board reports " + std::to_string(info.ADC_NBits) +
+          " bits, config requests " +
+          std::to_string(hardware_settings_.adc_bits));
+    }
+  };
+
+  // Opening a handle is read-only with respect to board state.  Verify the
+  // exact intended board class/serial/firmware before issuing Reset, so USB
+  // enumeration changes cannot make us reset an unrelated digitizer.
+  CAEN_DGTZ_BoardInfo_t pre_reset_info{};
+  CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &pre_reset_info));
+  validate_identity(pre_reset_info, "before reset");
+  std::cout << "\033[1;36m[Board Identity Pre-Reset]\033[0m model="
+            << pre_reset_info.ModelName << ", serial="
+            << pre_reset_info.SerialNumber << ", ROC="
+            << pre_reset_info.ROC_FirmwareRel << ", AMC="
+            << pre_reset_info.AMC_FirmwareRel << "\n";
+
+  digitizer_->Reset();
+
+  CAEN_DGTZ_BoardInfo_t board_info{};
+  CAEN_CHECK(CAEN_DGTZ_GetInfo(handle, &board_info));
+  validate_identity(board_info, "after reset");
+  if (std::string(board_info.ModelName) !=
+          std::string(pre_reset_info.ModelName) ||
+      board_info.SerialNumber != pre_reset_info.SerialNumber ||
+      board_info.FamilyCode != pre_reset_info.FamilyCode ||
+      board_info.ADC_NBits != pre_reset_info.ADC_NBits) {
+    throw std::runtime_error(
+        "Connected-board identity changed across reset; refusing further "
+        "register writes");
+  }
+  board_model_ = board_info.ModelName;
+  board_roc_firmware_ = board_info.ROC_FirmwareRel;
+  board_amc_firmware_ = board_info.AMC_FirmwareRel;
+  board_serial_number_ = board_info.SerialNumber;
+  board_adc_bits_ = board_info.ADC_NBits;
+
+  // The board was reset by CaenDigitizer.  Apply and verify the complete
+  // analog setup before enabling any trigger source.
   uint32_t acq_ctrl = 0;
   CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x8100, &acq_ctrl));
-  CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x8100, acq_ctrl & ~(1 << 3)));
+  const uint32_t requested_acq_ctrl =
+      (acq_ctrl & ~(static_cast<uint32_t>(1U << 3) |
+                    kExternalClockSelectMask)) |
+      (hardware_settings_.clock_source != 0 ? kExternalClockSelectMask : 0U);
+  CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x8100, requested_acq_ctrl));
+  const uint32_t acq_ctrl_readback = ReadRegister(handle, 0x8100);
+  clock_source_readback_ =
+      (acq_ctrl_readback & kExternalClockSelectMask) != 0U ? 1U : 0U;
+  if (clock_source_readback_ !=
+      static_cast<uint32_t>(hardware_settings_.clock_source)) {
+    throw std::runtime_error(
+        "Clock-source register verification failed at 0x00008100");
+  }
 
-  uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
-  uint32_t channel_mask = config_.GetInt("Digitizer", "ChannelMask", 0xFF);
-  uint32_t conf_post_trigger = config_.GetInt("Digitizer", "PostTrigger", 80);
-
-  record_length = ((record_length + 7) / 8) * 8; 
-
-  uint32_t logical_pre_samples = record_length * (100 - conf_post_trigger) / 100;
-  uint32_t hw_pre_samples = logical_pre_samples + 60;
-  
-  if (hw_pre_samples >= record_length) hw_pre_samples = record_length - 8; 
-  
-  uint32_t actual_post_trigger = 100 - (hw_pre_samples * 100 / record_length);
+  const uint32_t record_length = hardware_settings_.record_length;
+  const uint32_t channel_mask = hardware_settings_.channel_mask;
 
   CAEN_CHECK(CAEN_DGTZ_SetRecordLength(handle, record_length));
-  CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask)); 
-  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle, actual_post_trigger)); 
+  uint32_t record_length_readback = 0;
+  CAEN_CHECK(CAEN_DGTZ_GetRecordLength(handle, &record_length_readback));
+  if (record_length_readback != record_length) {
+    throw std::runtime_error(
+        "Record-length readback mismatch: requested " +
+        std::to_string(record_length) + ", read back " +
+        std::to_string(record_length_readback));
+  }
+  CAEN_CHECK(CAEN_DGTZ_SetChannelEnableMask(handle, channel_mask));
+  CAEN_CHECK(CAEN_DGTZ_GetChannelEnableMask(handle,
+                                            &channel_mask_readback_));
+  if (channel_mask_readback_ != channel_mask) {
+    throw std::runtime_error(
+        "Channel-enable mask readback mismatch: requested " +
+        Hex32(channel_mask) + ", read back " +
+        Hex32(channel_mask_readback_));
+  }
+  std::cout << "\033[1;36m[Digitizer Readback]\033[0m record_length="
+            << record_length_readback << ", channel_mask="
+            << Hex32(channel_mask_readback_) << "\n";
+  CAEN_CHECK(CAEN_DGTZ_SetPostTriggerSize(handle,
+                                          hardware_settings_.post_trigger));
+  CAEN_CHECK(CAEN_DGTZ_GetPostTriggerSize(handle,
+                                          &post_trigger_readback_));
+  const uint32_t expected_post_trigger_readback =
+      dt5730_constraints::PredictPostTriggerLayout(
+          record_length_readback, hardware_settings_.post_trigger)
+          .predicted_readback_percent;
+  if (post_trigger_readback_ != expected_post_trigger_readback) {
+    throw std::runtime_error(
+        "Post-trigger readback mismatch: requested " +
+        std::to_string(hardware_settings_.post_trigger) + ", expected " +
+        std::to_string(expected_post_trigger_readback) + ", observed " +
+        std::to_string(post_trigger_readback_));
+  }
+  CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
+  const auto requested_run_sync = static_cast<CAEN_DGTZ_RunSyncMode_t>(
+      hardware_settings_.run_sync_mode);
+  CAEN_CHECK(CAEN_DGTZ_SetRunSynchronizationMode(handle,
+                                                 requested_run_sync));
+  CAEN_DGTZ_RunSyncMode_t run_sync_readback{};
+  CAEN_CHECK(CAEN_DGTZ_GetRunSynchronizationMode(handle,
+                                                 &run_sync_readback));
+  run_sync_mode_readback_ = static_cast<int>(run_sync_readback);
+  if (run_sync_mode_readback_ != hardware_settings_.run_sync_mode) {
+    throw std::runtime_error("Run-synchronization mode readback mismatch");
+  }
+  clock_source_readback_ =
+      (ReadRegister(handle, 0x8100) & kExternalClockSelectMask) != 0U ? 1U
+                                                                      : 0U;
+  if (clock_source_readback_ !=
+      static_cast<uint32_t>(hardware_settings_.clock_source)) {
+    throw std::runtime_error(
+        "Clock source changed while applying run synchronization");
+  }
+  std::cout << "\033[1;36m[Synchronization Readback]\033[0m clock_source="
+            << clock_source_readback_ << " (0=internal, 1=external), mode="
+            << run_sync_mode_readback_ << "\n";
+  WaitForBoardReady(handle);
+  CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(
+      handle, CAEN_DGTZ_TRGMODE_DISABLED));
+  CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(
+      handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
+  CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, CAEN_DGTZ_TRGMODE_ACQ_ONLY));
 
-  uint32_t trigger_mask = config_.GetInt("Digitizer", "TriggerMask", channel_mask); 
-  uint32_t active_hardware_channels = channel_mask | trigger_mask; 
-  int pol_val = config_.GetInt("Digitizer", "TriggerPolarity", 1);
+  ConfigureInputRangeAndOffsets(handle);
+  CheckSetupCancellation();
+
+  digitizer_->AllocateBuffers();
+  const size_t max_safe_size =
+      sizeof(EventHeader) +
+      (record_length + 1024) * sizeof(uint16_t) * MAX_CH;
+  raw_buffer_pool_.resize(max_safe_size);
+
+  uint32_t threshold_calibration_mask = 0;
+  uint32_t dc_offset_target_mask = 0;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
+        hardware_settings_.channels[ch].threshold_is_relative_mv) {
+      threshold_calibration_mask |= 1U << ch;
+    }
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+        hardware_settings_.channels[ch].dc_offset_mode ==
+            DAQDCOffsetMode::kTargetBaseline) {
+      dc_offset_target_mask |= 1U << ch;
+    }
+  }
+  const uint32_t calibration_mask =
+      threshold_calibration_mask | dc_offset_target_mask;
+
+  std::array<double, MAX_CH> baselines{};
+  bool baselines_available = false;
+  if (dc_offset_target_mask != 0U) {
+    baselines = TuneTargetBaselineOffsets(handle);
+    baselines_available = true;
+  }
+  // A raw-DAC channel can still request a baseline-relative trigger.  If it
+  // was not part of the offset target loop, include it in a stable batch
+  // before calculating its discriminator code.
+  if ((threshold_calibration_mask & ~dc_offset_target_mask) != 0U) {
+    baselines = WaitForStableBaselines(
+        handle, calibration_mask,
+        baselines_available ? 0U
+                            : hardware_settings_.trigger_calibration
+                                  .settling_time_ms,
+        "trigger threshold calibration");
+    baselines_available = true;
+  }
+
+  if (calibration_mask != 0U) {
+    ProgramAndVerifyThresholds(handle, baselines);
+
+    // Measure once more immediately before installing the trigger route.  A
+    // moved baseline causes one complete re-settling/recalibration attempt;
+    // acquisition never starts with a stale threshold.
+    auto final_baselines = MeasureBaselineBatch(
+        handle, std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(hardware_settings_
+                                                  .trigger_calibration
+                                                  .settling_timeout_ms));
+    std::string target_failure;
+    if (!BaselinesAreStable(
+            baselines, final_baselines, calibration_mask,
+            hardware_settings_.trigger_calibration.stability_tolerance_adc) ||
+        !TargetBaselinesWithinTolerance(final_baselines, &target_failure)) {
+      std::cout << "\033[1;33m[Calibration]\033[0m Baseline moved or left "
+                   "its target before acquisition; repeating calibration";
+      if (!target_failure.empty()) std::cout << " (" << target_failure << ")";
+      std::cout << ".\n";
+      if (dc_offset_target_mask != 0U) {
+        baselines = TuneTargetBaselineOffsets(handle);
+        if ((threshold_calibration_mask & ~dc_offset_target_mask) != 0U) {
+          baselines = WaitForStableBaselines(
+              handle, calibration_mask, 0U,
+              "mixed DC-offset/trigger threshold recalibration");
+        }
+      } else {
+        baselines = WaitForStableBaselines(
+            handle, calibration_mask,
+            hardware_settings_.trigger_calibration.settling_time_ms,
+            "trigger threshold recalibration");
+      }
+      ProgramAndVerifyThresholds(handle, baselines);
+      final_baselines = MeasureBaselineBatch(
+          handle, std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(hardware_settings_
+                                                    .trigger_calibration
+                                                    .settling_timeout_ms));
+      target_failure.clear();
+      if (!BaselinesAreStable(
+              baselines, final_baselines, calibration_mask,
+              hardware_settings_.trigger_calibration.stability_tolerance_adc) ||
+          !TargetBaselinesWithinTolerance(final_baselines, &target_failure)) {
+        throw std::runtime_error(
+            "Baseline moved again immediately before acquisition; refusing "
+            "to start with an invalid DC offset or hardware threshold" +
+            (target_failure.empty() ? std::string{} :
+                                      ": " + target_failure));
+      }
+    }
+    ProgramAndVerifyThresholds(handle, final_baselines);
+  } else {
+    (void)baselines_available;
+    ProgramAndVerifyThresholds(handle, baselines);
+  }
+
+  CheckSetupCancellation();
+  ConfigureAndVerifyTriggerRouting(handle);
+  acquisition_status_ = "hardware_verified_not_started";
+}
+
+void DAQManager::CheckSetupCancellation() const {
+  if (cancellation_flag_ != nullptr &&
+      !cancellation_flag_->load(std::memory_order_relaxed)) {
+    throw DAQSetupCancelled(
+        "Hardware setup/baseline calibration cancelled by user");
+  }
+}
+
+void DAQManager::ConfigureInputRangeAndOffsets(int handle) {
+  const uint32_t requested_range_bit =
+      hardware_settings_.input_range_mv == 500U ? 1U : 0U;
+  const auto requested_polarity =
+      hardware_settings_.trigger_polarity == 0
+          ? CAEN_DGTZ_TriggerOnRisingEdge
+          : CAEN_DGTZ_TriggerOnFallingEdge;
 
   for (int ch = 0; ch < MAX_CH; ++ch) {
-      if ((active_hardware_channels >> ch) & 1) { 
-          std::string ch_sec = "Channel_" + std::to_string(ch);
-          uint32_t offset = config_.GetInt(ch_sec, "DCOffset", 7050);
-          uint32_t thr = config_.GetInt(ch_sec, "TriggerThreshold", 15000);
-          
-          CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(handle, ch, offset));
-          CAEN_CHECK(CAEN_DGTZ_SetTriggerPolarity(handle, ch, (pol_val == 0) ? CAEN_DGTZ_TriggerOnRisingEdge : CAEN_DGTZ_TriggerOnFallingEdge));
-          CAEN_CHECK(CAEN_DGTZ_SetChannelTriggerThreshold(handle, ch, thr));
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
+
+    auto& runtime = runtime_channels_[ch];
+    runtime.enabled = true;
+    runtime.participates_in_trigger =
+        ((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U;
+    const auto& configured = hardware_settings_.channels[ch];
+    runtime.dc_offset_target_mode =
+        configured.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline;
+    runtime.requested_baseline_percent =
+        configured.baseline_target_percent;
+    runtime.target_baseline_adc = configured.target_baseline_adc;
+    runtime.initial_dc_offset_dac = configured.dc_offset;
+    runtime.final_dc_offset_dac = configured.dc_offset;
+    runtime.requested_dc_offset = configured.dc_offset;
+    runtime.input_range_register =
+        kInputRangeBase + kChannelRegisterStride * ch;
+
+    WriteMaskedRegisterAndVerify(
+        handle, runtime.input_range_register, kInputRangeMask,
+        requested_range_bit, "Channel input range");
+    runtime.input_range_readback =
+        ReadRegister(handle, runtime.input_range_register) & kInputRangeMask;
+
+    WriteAndVerifyDCOffset(handle, ch, runtime.initial_dc_offset_dac);
+
+    CAEN_CHECK(CAEN_DGTZ_SetTriggerPolarity(handle, ch,
+                                             requested_polarity));
+    CAEN_DGTZ_TriggerPolarity_t polarity_readback{};
+    CAEN_CHECK(CAEN_DGTZ_GetTriggerPolarity(handle, ch,
+                                             &polarity_readback));
+    runtime.polarity_readback =
+        polarity_readback == CAEN_DGTZ_TriggerOnFallingEdge ? 1 : 0;
+    if (runtime.polarity_readback != hardware_settings_.trigger_polarity) {
+      throw std::runtime_error(
+          "CH" + std::to_string(ch) + " trigger-polarity readback mismatch");
+    }
+
+    std::cout << "\033[1;36m[Analog Setup]\033[0m CH" << ch
+              << " input_range=" << hardware_settings_.input_range_mv
+              << " mVpp (register " << Hex32(runtime.input_range_register)
+              << " readback=" << runtime.input_range_readback << ")"
+              << ", DCOffset mode="
+              << (runtime.dc_offset_target_mode ? "target-baseline"
+                                                : "raw-DAC")
+              << ", initial DAC=" << runtime.initial_dc_offset_dac
+              << " readback=" << runtime.readback_dc_offset
+              << (runtime.dc_offset_target_mode
+                      ? ", target=" +
+                            std::to_string(runtime.requested_baseline_percent) +
+                            "% (" +
+                            std::to_string(runtime.target_baseline_adc) +
+                            " ADC)"
+                      : "")
+              << ", polarity="
+              << (runtime.polarity_readback == 1 ? "falling" : "rising")
+              << "\n";
+  }
+}
+
+void DAQManager::WaitForDCOffsetReady(int handle, int channel) {
+  const uint32_t status_register =
+      kChannelStatusBase + kChannelRegisterStride *
+                               static_cast<uint32_t>(channel);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            hardware_settings_.dc_offset_calibration
+                                .dac_busy_timeout_ms);
+  while ((ReadRegister(handle, status_register) & kDCOffsetDacBusyMask) !=
+         0U) {
+    CheckSetupCancellation();
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          "CH" + std::to_string(channel) +
+          " DC-offset DAC remained busy at register " +
+          Hex32(status_register) + " for DacBusyTimeoutMs=" +
+          std::to_string(hardware_settings_.dc_offset_calibration
+                             .dac_busy_timeout_ms));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void DAQManager::WriteAndVerifyDCOffset(int handle, int channel,
+                                       uint32_t value) {
+  if (value > kMaximumDCOffsetDac) {
+    throw std::logic_error("DC-offset DAC request exceeds 16-bit range");
+  }
+  WaitForDCOffsetReady(handle, channel);
+  CAEN_CHECK(CAEN_DGTZ_SetChannelDCOffset(
+      handle, static_cast<uint32_t>(channel), value));
+  WaitForDCOffsetReady(handle, channel);
+
+  auto& runtime = runtime_channels_[channel];
+  uint32_t readback = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetChannelDCOffset(
+      handle, static_cast<uint32_t>(channel), &readback));
+  if (readback != value) {
+    throw std::runtime_error(
+        "CH" + std::to_string(channel) +
+        " DC-offset readback mismatch: wrote " + std::to_string(value) +
+        ", read " + std::to_string(readback));
+  }
+  runtime.requested_dc_offset = value;
+  runtime.final_dc_offset_dac = value;
+  runtime.readback_dc_offset = readback;
+}
+
+bool DAQManager::TargetBaselinesWithinTolerance(
+    const std::array<double, MAX_CH>& baselines,
+    std::string* failure_detail) const {
+  const double maximum_adc =
+      static_cast<double>((uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+  const double tolerance_adc =
+      hardware_settings_.dc_offset_calibration.target_tolerance_percent *
+      maximum_adc / 100.0;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U ||
+        hardware_settings_.channels[ch].dc_offset_mode !=
+            DAQDCOffsetMode::kTargetBaseline) {
+      continue;
+    }
+    const double error = baselines[ch] -
+                         static_cast<double>(hardware_settings_.channels[ch]
+                                                 .target_baseline_adc);
+    if (!std::isfinite(baselines[ch]) || std::abs(error) > tolerance_adc) {
+      if (failure_detail != nullptr) {
+        std::ostringstream detail;
+        detail << "CH" << ch << " measured=" << std::fixed
+               << std::setprecision(3) << baselines[ch]
+               << " ADC, target="
+               << hardware_settings_.channels[ch].target_baseline_adc
+               << " ADC, error=" << error << " ADC, tolerance="
+               << tolerance_adc << " ADC";
+        *failure_detail = detail.str();
       }
+      return false;
+    }
+  }
+  if (failure_detail != nullptr) failure_detail->clear();
+  return true;
+}
+
+std::array<double, MAX_CH> DAQManager::TuneTargetBaselineOffsets(int handle) {
+  uint32_t target_mask = 0U;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+        hardware_settings_.channels[ch].dc_offset_mode ==
+            DAQDCOffsetMode::kTargetBaseline) {
+      target_mask |= 1U << ch;
+      runtime_channels_[ch].dc_offset_converged = false;
+    }
+  }
+  if (target_mask == 0U) {
+    throw std::logic_error(
+        "Target-baseline tuning called without a target-mode channel");
   }
 
-  CAEN_DGTZ_TriggerMode_t trg_mode = CAEN_DGTZ_TRGMODE_ACQ_ONLY;
-  int ext_trg = config_.GetInt("Digitizer", "ExtTriggerMode", 1);
-  if (ext_trg > 0) CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, trg_mode));
-  else CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(handle, CAEN_DGTZ_TRGMODE_DISABLED));
-  
-  int trigger_logic = config_.GetInt("Digitizer", "TriggerLogic", 0); 
-  int self_trg = config_.GetInt("Digitizer", "SelfTriggerMode", 1);
+  std::array<uint32_t, MAX_CH> previous_dac{};
+  std::array<double, MAX_CH> previous_baseline{};
+  std::array<bool, MAX_CH> has_previous_observation{};
+  const double maximum_adc =
+      static_cast<double>((uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+  const double nominal_adc_per_dac =
+      -maximum_adc / static_cast<double>(kMaximumDCOffsetDac);
+  const double tolerance_adc =
+      hardware_settings_.dc_offset_calibration.target_tolerance_percent *
+      maximum_adc / 100.0;
+  const uint32_t max_adjustments =
+      hardware_settings_.dc_offset_calibration.max_adjustment_iterations;
 
-  if (self_trg > 0) {
-      CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, trg_mode, trigger_mask));
-      
-      uint32_t trg_src_mask = 0;
-      CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x810C, &trg_src_mask));
-      
-      uint32_t pair_mask = 0;
-      for (int i = 0; i < MAX_CH; ++i) {
-          if ((trigger_mask >> i) & 1) pair_mask |= (1 << (i / 2));
+  std::array<double, MAX_CH> baselines{};
+  for (uint32_t adjustment_round = 0U;
+       adjustment_round <= max_adjustments; ++adjustment_round) {
+    const uint32_t settling_ms =
+        adjustment_round == 0U
+            ? hardware_settings_.trigger_calibration.settling_time_ms
+            : hardware_settings_.dc_offset_calibration
+                  .step_settling_time_ms;
+    baselines = WaitForStableBaselines(
+        handle, target_mask, settling_ms, "DC-offset target calibration");
+
+    bool all_converged = true;
+    std::ostringstream failure_summary;
+    bool first_failure = true;
+    for (int ch = 0; ch < MAX_CH; ++ch) {
+      if (((target_mask >> ch) & 1U) == 0U) continue;
+      auto& runtime = runtime_channels_[ch];
+      runtime.baseline_measured = true;
+      runtime.measured_baseline_adc = baselines[ch];
+      runtime.baseline_error_adc =
+          baselines[ch] - static_cast<double>(runtime.target_baseline_adc);
+      runtime.dc_offset_converged =
+          std::abs(runtime.baseline_error_adc) <= tolerance_adc;
+      if (!runtime.dc_offset_converged) {
+        all_converged = false;
+        if (!first_failure) failure_summary << "; ";
+        first_failure = false;
+        failure_summary << "CH" << ch << " measured=" << std::fixed
+                        << std::setprecision(3) << baselines[ch]
+                        << " target=" << runtime.target_baseline_adc
+                        << " error=" << runtime.baseline_error_adc
+                        << " ADC DAC=" << runtime.readback_dc_offset;
+      }
+    }
+
+    if (all_converged) {
+      for (int ch = 0; ch < MAX_CH; ++ch) {
+        if (((target_mask >> ch) & 1U) == 0U) continue;
+        const auto& runtime = runtime_channels_[ch];
+        std::cout << "\033[1;32m[DC Offset Calibration]\033[0m CH" << ch
+                  << " requested=" << std::fixed << std::setprecision(3)
+                  << runtime.requested_baseline_percent << "% target="
+                  << runtime.target_baseline_adc << " ADC, measured="
+                  << runtime.measured_baseline_adc << " ADC, error="
+                  << runtime.baseline_error_adc << " ADC, initial DAC="
+                  << runtime.initial_dc_offset_dac << ", final DAC="
+                  << runtime.final_dc_offset_dac << " readback="
+                  << runtime.readback_dc_offset << ", adjustments="
+                  << runtime.dc_offset_adjustment_iterations << "\n";
+      }
+      return baselines;
+    }
+
+    if (adjustment_round == max_adjustments) {
+      throw std::runtime_error(
+          "DC-offset target calibration failed to converge within " +
+          std::to_string(max_adjustments) + " adjustment iterations: " +
+          failure_summary.str());
+    }
+
+    for (int ch = 0; ch < MAX_CH; ++ch) {
+      if (((target_mask >> ch) & 1U) == 0U ||
+          runtime_channels_[ch].dc_offset_converged) {
+        continue;
+      }
+      auto& runtime = runtime_channels_[ch];
+      const uint32_t current_dac = runtime.readback_dc_offset;
+      double adc_per_dac = nominal_adc_per_dac;
+      if (has_previous_observation[ch] &&
+          previous_dac[ch] != current_dac) {
+        const double observed_slope =
+            (baselines[ch] - previous_baseline[ch]) /
+            (static_cast<double>(current_dac) -
+             static_cast<double>(previous_dac[ch]));
+        // Only trust a measured slope that is resolvably negative.  A
+        // positive, sufficiently large response is non-physical for this
+        // board mapping and is safer to reject than to chase toward a rail.
+        if (observed_slope < -1e-5) {
+          adc_per_dac = observed_slope;
+        } else if (std::abs(baselines[ch] - previous_baseline[ch]) >
+                   tolerance_adc) {
+          throw std::runtime_error(
+              "CH" + std::to_string(ch) +
+              " DC-offset response is non-monotonic; refusing further DAC "
+              "adjustment");
+        }
       }
 
-      trg_src_mask &= ~0xFF; 
-      trg_src_mask |= (pair_mask & 0xFF); 
+      const double unbounded_adjustment =
+          -runtime.baseline_error_adc / adc_per_dac;
+      int64_t adjustment = static_cast<int64_t>(
+          std::llround(std::clamp(
+              unbounded_adjustment,
+              -static_cast<double>(kMaximumDCOffsetAdjustmentStep),
+              static_cast<double>(kMaximumDCOffsetAdjustmentStep))));
+      if (adjustment == 0) {
+        adjustment = runtime.baseline_error_adc > 0.0 ? 1 : -1;
+      }
+      const int64_t candidate = std::clamp<int64_t>(
+          static_cast<int64_t>(current_dac) + adjustment, 0,
+          static_cast<int64_t>(kMaximumDCOffsetDac));
+      if (candidate == static_cast<int64_t>(current_dac)) {
+        throw std::runtime_error(
+            "CH" + std::to_string(ch) +
+            " cannot reach the requested baseline before the 16-bit "
+            "DC-offset DAC rail");
+      }
 
-      trg_src_mask &= ~(0x7 << 24); 
-      trg_src_mask &= ~(0xF << 20); 
+      previous_dac[ch] = current_dac;
+      previous_baseline[ch] = baselines[ch];
+      has_previous_observation[ch] = true;
+      WriteAndVerifyDCOffset(handle, ch,
+                             static_cast<uint32_t>(candidate));
+      ++runtime.dc_offset_adjustment_iterations;
+      std::cout << "\033[1;36m[DC Offset Adjustment]\033[0m CH" << ch
+                << " measured=" << std::fixed << std::setprecision(3)
+                << baselines[ch] << " ADC, target="
+                << runtime.target_baseline_adc << " ADC, previous DAC="
+                << current_dac << ", written/readback DAC="
+                << runtime.readback_dc_offset << "\n";
+    }
+  }
 
-      int maj_level = config_.GetInt("HardwareCoincidence", "MajorityLevel", -1);
-      int maj_window = config_.GetInt("HardwareCoincidence", "MajorityWindow", 3);
+  throw std::logic_error("Unreachable DC-offset calibration state");
+}
 
-      uint32_t active_pairs = 0;
-      for (int i = 0; i < 4; ++i) { if ((pair_mask >> i) & 1) active_pairs++; }
+std::array<double, MAX_CH> DAQManager::MeasureBaselineBatch(
+    int handle, std::chrono::steady_clock::time_point deadline) {
+  const std::size_t adc_codes =
+      std::size_t{1} << hardware_settings_.adc_bits;
+  std::array<std::vector<uint64_t>, MAX_CH> histograms;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) != 0U) {
+      histograms[ch].assign(adc_codes, 0U);
+    }
+  }
+  const uint32_t requested_events =
+      hardware_settings_.trigger_calibration.measurement_events;
+  uint32_t decoded_events = 0;
+  bool acquisition_started = false;
 
-      if (trigger_logic == 1) { 
-          if (maj_level >= 0) {
-              if ((uint32_t)maj_level >= active_pairs) {
-                  std::cout << "\033[1;31m[FPGA Warning]\033[0m User MajorityLevel " << maj_level 
-                            << " requires " << (maj_level + 1) << " Pairs, but only " << active_pairs 
-                            << " Pairs are active! Forcing Level to " << (active_pairs > 0 ? active_pairs - 1 : 0) << "\n";
-                  maj_level = (active_pairs > 0) ? active_pairs - 1 : 0;
-              }
-              trg_src_mask |= ((maj_level & 0x7) << 24);
-              trg_src_mask |= ((maj_window & 0xF) << 20);
-          } else {
-              uint32_t level = (active_pairs > 0) ? active_pairs - 1 : 0;
-              trg_src_mask |= ((level & 0x7) << 24);
-              trg_src_mask |= ((maj_window & 0xF) << 20);
+  try {
+    CheckSetupCancellation();
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          "Baseline settling failed: measurement deadline expired before "
+          "software acquisition started");
+    }
+    CAEN_CHECK(CAEN_DGTZ_ClearData(handle));
+    CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(handle));
+    acquisition_started = true;
+    char* readout_buffer = digitizer_->GetReadoutBuffer();
+    auto* decoded_event = digitizer_->GetDecodedEvent();
+    while (decoded_events < requested_events &&
+           std::chrono::steady_clock::now() < deadline) {
+      CheckSetupCancellation();
+      // Issue and drain one calibration trigger at a time.  Sending all
+      // MeasurementEvents before reading can overflow the digitizer FIFO at
+      // otherwise-valid high settings.
+      CAEN_CHECK(CAEN_DGTZ_SendSWtrigger(handle));
+      bool trigger_drained = false;
+      while (!trigger_drained &&
+             std::chrono::steady_clock::now() < deadline) {
+        CheckSetupCancellation();
+        uint32_t bytes_read = 0;
+        CAEN_CHECK(CAEN_DGTZ_ReadData(
+            handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT,
+            readout_buffer, &bytes_read));
+        if (bytes_read == 0U) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+
+        uint32_t event_count = 0;
+        CAEN_CHECK(CAEN_DGTZ_GetNumEvents(
+            handle, readout_buffer, bytes_read, &event_count));
+        if (event_count == 0U) continue;
+        trigger_drained = true;
+        for (uint32_t event_index = 0;
+             event_index < event_count && decoded_events < requested_events;
+             ++event_index) {
+        CAEN_DGTZ_EventInfo_t event_info{};
+        char* event_pointer = nullptr;
+        CAEN_CHECK(CAEN_DGTZ_GetEventInfo(
+            handle, readout_buffer, bytes_read, event_index, &event_info,
+            &event_pointer));
+        VerifyCaenStandardEventHeader(event_pointer, event_info.EventSize,
+                                      readout_buffer, bytes_read, event_index,
+                                      event_count, "Baseline calibration");
+        CAEN_CHECK(CAEN_DGTZ_DecodeEvent(
+            handle, event_pointer, reinterpret_cast<void**>(&decoded_event)));
+        if (decoded_event == nullptr) {
+          throw std::runtime_error(
+              "Baseline event decode returned a null waveform object");
+        }
+        if (event_info.ChannelMask != hardware_settings_.channel_mask) {
+          throw std::runtime_error(
+              "Baseline event channel mask does not match the configured "
+              "readout mask");
+        }
+
+        for (int ch = 0; ch < MAX_CH; ++ch) {
+          if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U ||
+              ((event_info.ChannelMask >> ch) & 1U) == 0U) {
+            continue;
           }
-          std::cout << "\033[1;36m[FPGA Trigger]\033[0m Hardware Coincidence (AND) Logic Active. Required Pairs: " << ((trg_src_mask >> 24 & 0x7) + 1) << "\n";
-      } else { 
-          trg_src_mask |= ((maj_window & 0xF) << 20); 
-          std::cout << "\033[1;36m[FPGA Trigger]\033[0m Independent (OR) Logic Active. (Any active Pair triggers)\n";
+          const uint32_t trace_size = decoded_event->ChSize[ch];
+          const uint16_t* trace = decoded_event->DataChannel[ch];
+          if (trace == nullptr || trace_size == 0U ||
+              trace_size != hardware_settings_.record_length) {
+            throw std::runtime_error(
+                "Baseline event has a missing or malformed CH" +
+                std::to_string(ch) + " waveform");
+          }
+          // DC-offset and trigger calibration must estimate the quiet
+          // pre-trigger baseline, not the pulse-bearing part of the trace.
+          const uint32_t baseline_samples = std::min<uint32_t>(
+              trace_size,
+              hardware_settings_.software_dsp.waveform.baseline_samples);
+          for (uint32_t sample = 0; sample < baseline_samples; ++sample) {
+            const uint16_t code = trace[sample];
+            if (code >= adc_codes) {
+              throw std::runtime_error(
+                  "Baseline waveform contains an ADC code outside the "
+                  "configured resolution");
+            }
+            ++histograms[ch][code];
+          }
+        }
+        ++decoded_events;
+        }
       }
-
-      CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x810C, trg_src_mask));
-
-  } else {
-      CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(handle, CAEN_DGTZ_TRGMODE_DISABLED, 0xFF));
-      
-      uint32_t trg_src_mask = 0;
-      CAEN_CHECK(CAEN_DGTZ_ReadRegister(handle, 0x810C, &trg_src_mask));
-      trg_src_mask &= ~0xFF; 
-      CAEN_CHECK(CAEN_DGTZ_WriteRegister(handle, 0x810C, trg_src_mask));
-      
-      std::cout << "\033[1;36m[FPGA Trigger]\033[0m Self-Trigger Disabled (External Only).\n";
+    }
+    CAEN_CHECK(CAEN_DGTZ_SWStopAcquisition(handle));
+    acquisition_started = false;
+    CAEN_CHECK(CAEN_DGTZ_ClearData(handle));
+  } catch (...) {
+    if (acquisition_started) CAEN_DGTZ_SWStopAcquisition(handle);
+    CAEN_DGTZ_ClearData(handle);
+    throw;
   }
 
-  CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(handle, trg_mode));
-  CAEN_CHECK(CAEN_DGTZ_SetAcquisitionMode(handle, CAEN_DGTZ_SW_CONTROLLED));
+  if (decoded_events < requested_events) {
+    throw std::runtime_error(
+        "Baseline settling failed: software-trigger measurement timed out "
+        "after " + std::to_string(decoded_events) + "/" +
+        std::to_string(requested_events) + " events");
+  }
 
-  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Standard Firmware Logic configuration ready.\n";
+  std::array<double, MAX_CH> baselines{};
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
+    baselines[ch] = HistogramMedian(histograms[ch]);
+  }
+  return baselines;
+}
 
-  std::cout << "\033[1;33m[Hardware] Waiting 1 second for analog baseline (DAC) to settle...\033[0m\n";
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-  CAEN_CHECK(CAEN_DGTZ_ClearData(handle)); 
+std::array<double, MAX_CH> DAQManager::WaitForStableBaselines(
+    int handle, uint32_t channel_mask, uint32_t initial_settling_time_ms,
+    const std::string& context) {
+  if (channel_mask == 0U ||
+      (channel_mask & ~hardware_settings_.channel_mask) != 0U) {
+    throw std::logic_error(
+        "Stable-baseline measurement mask is empty or outside ChannelMask");
+  }
+  const auto& calibration = hardware_settings_.trigger_calibration;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            calibration.settling_timeout_ms);
+  const auto settling_end = std::min(
+      deadline, std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(initial_settling_time_ms));
+  while (std::chrono::steady_clock::now() < settling_end) {
+    CheckSetupCancellation();
+    std::this_thread::sleep_until(std::min(
+        settling_end, std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(50)));
+  }
 
-  digitizer_.AllocateBuffers();
-  
-  size_t max_safe_size = sizeof(EventHeader) + (record_length + 1024) * sizeof(uint16_t) * MAX_CH;
-  raw_buffer_pool_.resize(max_safe_size);
+  std::vector<BaselineMeasurement> measurements;
+  while (std::chrono::steady_clock::now() < deadline) {
+    CheckSetupCancellation();
+    measurements.push_back(MeasureBaselineBatch(handle, deadline));
+    if (measurements.size() <= 10U ||
+        measurements.size() % 50U == 0U) {
+      std::cout << "\033[1;36m[Baseline]\033[0m " << context
+                << " measurement " << measurements.size();
+      for (int ch = 0; ch < MAX_CH; ++ch) {
+        if (((channel_mask >> ch) & 1U) != 0U) {
+          std::cout << " CH" << ch << "=" << std::fixed
+                    << std::setprecision(3) << measurements.back()[ch]
+                    << " ADC";
+        }
+      }
+      std::cout << "\n";
+    }
+
+    if (measurements.size() >= calibration.stable_measurements) {
+      try {
+        return RequireSettledBaselines(
+            measurements, channel_mask,
+            calibration.stability_tolerance_adc,
+            calibration.stable_measurements);
+      } catch (const std::runtime_error&) {
+        // More measurements may still settle before the configured deadline.
+      }
+    }
+  }
+  throw std::runtime_error(
+      "Baseline settling failed during " + context +
+      " before SettlingTimeoutMs=" +
+      std::to_string(calibration.settling_timeout_ms));
+}
+
+void DAQManager::ProgramAndVerifyThresholds(
+    int handle, const std::array<double, MAX_CH>& baselines) {
+  const double lsb_mv =
+      static_cast<double>(hardware_settings_.input_range_mv) /
+      static_cast<double>(1U << hardware_settings_.adc_bits);
+  bool measured_baselines_available = false;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    const auto& channel = hardware_settings_.channels[ch];
+    if ((((hardware_settings_.self_trigger_mask >> ch) & 1U) != 0U &&
+         channel.threshold_is_relative_mv) ||
+        (((hardware_settings_.channel_mask >> ch) & 1U) != 0U &&
+         channel.dc_offset_mode == DAQDCOffsetMode::kTargetBaseline)) {
+      measured_baselines_available = true;
+      break;
+    }
+  }
+
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
+
+    const auto& configured = hardware_settings_.channels[ch];
+    auto& runtime = runtime_channels_[ch];
+    if (measured_baselines_available) {
+      runtime.baseline_measured = true;
+      runtime.measured_baseline_adc = baselines[ch];
+      if (runtime.dc_offset_target_mode) {
+        runtime.baseline_error_adc =
+            baselines[ch] - static_cast<double>(runtime.target_baseline_adc);
+        const double maximum_adc = static_cast<double>(
+            (uint32_t{1} << hardware_settings_.adc_bits) - 1U);
+        const double tolerance_adc =
+            hardware_settings_.dc_offset_calibration
+                .target_tolerance_percent *
+            maximum_adc / 100.0;
+        runtime.dc_offset_converged =
+            std::abs(runtime.baseline_error_adc) <= tolerance_adc;
+      }
+    }
+    if (!runtime.participates_in_trigger) {
+      std::cout << "\033[1;36m[Trigger Threshold]\033[0m CH" << ch
+                << " record-only; discriminator register is not used or "
+                   "programmed";
+      if (runtime.baseline_measured) {
+        std::cout << ", measured baseline=" << std::fixed
+                  << std::setprecision(3) << runtime.measured_baseline_adc
+                  << " ADC";
+      }
+      std::cout << "\n";
+      continue;
+    }
+    runtime.threshold_programmed = true;
+    if (configured.threshold_is_relative_mv) {
+      const auto result = CalculateAbsoluteTriggerThreshold(
+          baselines[ch], configured.trigger_threshold_mv,
+          hardware_settings_.input_range_mv, hardware_settings_.adc_bits,
+          hardware_settings_.trigger_polarity);
+      runtime.measured_threshold = true;
+      runtime.measured_baseline_adc = result.measured_baseline_adc;
+      runtime.requested_threshold_mv = result.requested_threshold_mv;
+      runtime.delta_adc = result.delta_adc;
+      runtime.written_threshold_adc = result.absolute_threshold_adc;
+      runtime.effective_threshold_mv = result.effective_threshold_mv;
+      if (std::abs(runtime.effective_threshold_mv -
+                   runtime.requested_threshold_mv) > lsb_mv + 1e-9) {
+        throw std::runtime_error(
+            "CH" + std::to_string(ch) +
+            " effective threshold differs from the request by more than one "
+            "ADC count after baseline/threshold quantization");
+      }
+    } else {
+      runtime.measured_threshold = false;
+      runtime.written_threshold_adc = configured.trigger_threshold;
+    }
+
+    CAEN_CHECK(CAEN_DGTZ_SetChannelTriggerThreshold(
+        handle, ch, runtime.written_threshold_adc));
+    CAEN_CHECK(CAEN_DGTZ_GetChannelTriggerThreshold(
+        handle, ch, &runtime.readback_threshold_adc));
+    if (runtime.readback_threshold_adc != runtime.written_threshold_adc) {
+      throw std::runtime_error(
+          "CH" + std::to_string(ch) + " threshold readback mismatch: wrote " +
+          std::to_string(runtime.written_threshold_adc) + ", read " +
+          std::to_string(runtime.readback_threshold_adc));
+    }
+
+    if (runtime.measured_threshold) {
+      std::cout << "\033[1;32m[Trigger Calibration]\033[0m CH" << ch
+                << " baseline=" << std::fixed << std::setprecision(3)
+                << runtime.measured_baseline_adc << " ADC, requested="
+                << runtime.requested_threshold_mv << " mV, delta="
+                << runtime.delta_adc << " ADC, written="
+                << runtime.written_threshold_adc << ", readback="
+                << runtime.readback_threshold_adc << ", effective="
+                << std::setprecision(6) << runtime.effective_threshold_mv
+                << " mV\n";
+    } else {
+      std::cout << "\033[1;33m[Trigger Threshold]\033[0m CH" << ch
+                << " legacy absolute ADC code written/readback="
+                << runtime.readback_threshold_adc << "\n";
+    }
+  }
+}
+
+void DAQManager::ConfigureAndVerifyTriggerRouting(int handle) {
+  const auto trigger_mode = CAEN_DGTZ_TRGMODE_ACQ_ONLY;
+  const int external_trigger = hardware_settings_.ext_trigger_mode;
+  const int self_trigger = hardware_settings_.self_trigger_mode;
+  const uint32_t self_trigger_mask = hardware_settings_.self_trigger_mask;
+
+  CAEN_CHECK(CAEN_DGTZ_SetExtTriggerInputMode(
+      handle, external_trigger > 0 ? trigger_mode
+                                   : CAEN_DGTZ_TRGMODE_DISABLED));
+  CAEN_CHECK(CAEN_DGTZ_SetChannelSelfTrigger(
+      handle, self_trigger > 0 ? trigger_mode
+                               : CAEN_DGTZ_TRGMODE_DISABLED,
+      self_trigger > 0 ? self_trigger_mask : 0xFF));
+
+  // Explicit split-mask configurations do not allow software triggers to
+  // bypass the selected physical route.  Legacy configs preserve old behavior.
+  const bool software_trigger_enabled =
+      hardware_settings_.software_random_trigger_mode != 0 ||
+      !hardware_settings_.explicit_trigger_routing;
+  CAEN_CHECK(CAEN_DGTZ_SetSWTriggerMode(
+      handle, software_trigger_enabled ? trigger_mode
+                                       : CAEN_DGTZ_TRGMODE_DISABLED));
+
+  if (self_trigger > 0 && hardware_settings_.explicit_trigger_routing) {
+    for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+      const uint32_t pair_bits = (self_trigger_mask >> (pair * 2)) & 0x3U;
+      if (pair_bits == 0U) continue;
+
+      const uint32_t pair_logic_register =
+          kPairTriggerLogicBase + kPairRegisterStride * pair;
+      // Bit 2 = 1 selects the actual over/under-threshold comparator signal.
+      // Bits [1:0] select AND, even-only, odd-only, or OR for the pair.
+      WriteMaskedRegisterAndVerify(
+          handle, pair_logic_register, kPairLogicFieldMask,
+          X730PairTriggerLogicField(pair_bits, hardware_settings_.pair_logic),
+          "Adjacent-channel trigger logic");
+      pair_logic_readback_[pair] =
+          ReadRegister(handle, pair_logic_register) & kPairLogicFieldMask;
+      std::cout << "\033[1;36m[FPGA Trigger Readback]\033[0m pair CH"
+                << pair * 2 << "/CH" << pair * 2 + 1
+                << " register=" << Hex32(pair_logic_register)
+                << ", requested_field="
+                << Hex32(X730PairTriggerLogicField(
+                       pair_bits, hardware_settings_.pair_logic))
+                << ", readback_field="
+                << Hex32(pair_logic_readback_[pair]) << "\n";
+    }
+
+    // A level of zero combines enabled pair requests with OR. This is distinct
+    // from the AND/OR operation performed inside each adjacent channel pair.
+    WriteMaskedRegisterAndVerify(handle, kGlobalTriggerMaskRegister,
+                                 kMajorityLevelMask, 0,
+                                 "Global pair-request logic");
+  }
+
+  global_trigger_mask_readback_ =
+      ReadRegister(handle, kGlobalTriggerMaskRegister);
+  const uint32_t expected_pair_requests =
+      self_trigger > 0 ? PairRequestMask(self_trigger_mask) : 0U;
+  const uint32_t source_field_mask =
+      kPairTriggerRequestMask | kExternalTriggerEnableMask |
+      kSoftwareTriggerEnableMask;
+  const uint32_t expected_source_fields =
+      expected_pair_requests |
+      (external_trigger > 0 ? kExternalTriggerEnableMask : 0U) |
+      (software_trigger_enabled ? kSoftwareTriggerEnableMask : 0U);
+  if ((global_trigger_mask_readback_ & source_field_mask) !=
+      expected_source_fields) {
+    throw std::runtime_error(
+        "Global trigger source verification failed at " +
+        Hex32(kGlobalTriggerMaskRegister) + ": requested " +
+        Hex32(expected_source_fields) + ", read " +
+        Hex32(global_trigger_mask_readback_ & source_field_mask));
+  }
+
+  std::cout << "\033[1;36m[FPGA Trigger]\033[0m Record mask="
+            << Hex32(hardware_settings_.channel_mask)
+            << ", self-trigger mask="
+            << Hex32(self_trigger_mask);
+  if (self_trigger > 0) {
+    std::cout << ", route="
+              << DescribeTriggerRouting(self_trigger_mask,
+                                        hardware_settings_.pair_logic);
+    if (hardware_settings_.explicit_trigger_routing) {
+      std::cout << ", comparator source=over-threshold";
+    } else {
+      std::cout << " (legacy pair-register behavior)";
+    }
+  } else {
+    std::cout << ", self-trigger disabled";
+  }
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    std::cout << ", software-random=" << std::fixed << std::setprecision(6)
+              << hardware_settings_.software_random_trigger_rate_hz << " Hz";
+  }
+  std::cout << ", global readback=" << Hex32(global_trigger_mask_readback_)
+            << ".\n";
+}
+
+void DAQManager::VerifyRuntimeConfiguration(int handle) {
+  uint32_t record_length = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetRecordLength(handle, &record_length));
+  if (record_length != hardware_settings_.record_length) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: record length changed from " +
+        std::to_string(hardware_settings_.record_length) + " to " +
+        std::to_string(record_length));
+  }
+
+  uint32_t channel_mask = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetChannelEnableMask(handle, &channel_mask));
+  if (channel_mask != channel_mask_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: channel-enable mask changed from " +
+        Hex32(channel_mask_readback_) + " to " + Hex32(channel_mask));
+  }
+
+  uint32_t post_trigger = 0U;
+  CAEN_CHECK(CAEN_DGTZ_GetPostTriggerSize(handle, &post_trigger));
+  if (post_trigger != post_trigger_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: post-trigger percentage changed from " +
+        std::to_string(post_trigger_readback_) + " to " +
+        std::to_string(post_trigger));
+  }
+
+  const uint32_t clock_source =
+      (ReadRegister(handle, 0x8100U) & kExternalClockSelectMask) != 0U ? 1U
+                                                                      : 0U;
+  if (clock_source != clock_source_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: digitizer clock source changed");
+  }
+
+  CAEN_DGTZ_RunSyncMode_t run_sync_mode{};
+  CAEN_CHECK(CAEN_DGTZ_GetRunSynchronizationMode(handle, &run_sync_mode));
+  if (static_cast<int>(run_sync_mode) != run_sync_mode_readback_) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: run-synchronization mode changed");
+  }
+
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    const auto& runtime = runtime_channels_[ch];
+    if (!runtime.enabled) continue;
+    const uint32_t range =
+        ReadRegister(handle, runtime.input_range_register) & kInputRangeMask;
+    if (range != runtime.input_range_readback) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " input range register changed");
+    }
+    uint32_t dc_offset = 0U;
+    CAEN_CHECK(CAEN_DGTZ_GetChannelDCOffset(handle, ch, &dc_offset));
+    if (dc_offset != runtime.readback_dc_offset) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " DC offset changed");
+    }
+    CAEN_DGTZ_TriggerPolarity_t polarity{};
+    CAEN_CHECK(CAEN_DGTZ_GetTriggerPolarity(handle, ch, &polarity));
+    const int polarity_value =
+        polarity == CAEN_DGTZ_TriggerOnFallingEdge ? 1 : 0;
+    if (polarity_value != runtime.polarity_readback) {
+      throw FatalAcquisitionError(
+          "Runtime configuration drift: CH" + std::to_string(ch) +
+          " trigger polarity changed");
+    }
+    if (runtime.threshold_programmed) {
+      uint32_t threshold = 0U;
+      CAEN_CHECK(CAEN_DGTZ_GetChannelTriggerThreshold(
+          handle, ch, &threshold));
+      if (threshold != runtime.readback_threshold_adc) {
+        throw FatalAcquisitionError(
+            "Runtime configuration drift: CH" + std::to_string(ch) +
+            " discriminator threshold changed");
+      }
+    }
+  }
+
+  const uint32_t global_trigger = ReadRegister(handle, kGlobalTriggerMaskRegister);
+  constexpr uint32_t kAuditedGlobalTriggerFields =
+      kPairTriggerRequestMask | kMajorityLevelMask |
+      kExternalTriggerEnableMask | kSoftwareTriggerEnableMask;
+  if ((global_trigger & kAuditedGlobalTriggerFields) !=
+      (global_trigger_mask_readback_ & kAuditedGlobalTriggerFields)) {
+    throw FatalAcquisitionError(
+        "Runtime configuration drift: global trigger-routing register changed");
+  }
+  if (hardware_settings_.explicit_trigger_routing) {
+    for (int pair = 0; pair < MAX_CH / 2; ++pair) {
+      if (((hardware_settings_.self_trigger_mask >> (pair * 2)) & 0x3U) ==
+          0U) {
+        continue;
+      }
+      const uint32_t observed =
+          ReadRegister(handle,
+                       kPairTriggerLogicBase + kPairRegisterStride * pair) &
+          kPairLogicFieldMask;
+      if (observed != pair_logic_readback_[pair]) {
+        throw FatalAcquisitionError(
+            "Runtime configuration drift: CH" + std::to_string(pair * 2) +
+            "/CH" + std::to_string(pair * 2 + 1) +
+            " pair-trigger logic changed");
+      }
+    }
+  }
+  ++runtime_configuration_checks_;
+}
+
+void DAQManager::VerifyAcquisitionStartCapacity() {
+  const uint64_t available = FilesystemFreeBytes(working_output_file_);
+  const uint64_t reserve = hardware_settings_.storage.minimum_free_bytes;
+  if (available < reserve ||
+      expected_raw_bytes_ > available - reserve) {
+    throw std::runtime_error(
+        "Output-filesystem capacity changed during hardware setup: "
+        "available=" + std::to_string(available) +
+        " bytes, expected_raw=" + std::to_string(expected_raw_bytes_) +
+        " bytes, required_reserve=" + std::to_string(reserve) + " bytes");
+  }
+  output_free_bytes_at_start_ = available;
+  std::cout << "\033[1;36m[Storage Start Check]\033[0m filesystem_free="
+            << available << " bytes, expected_raw=" << expected_raw_bytes_
+            << " bytes, reserve=" << reserve << " bytes\n";
+}
+
+void DAQManager::WaitForBoardReady(int handle) {
+  // Reading 0xEF04 clears the x730 PLL-unlock latch.  Inspect the live status
+  // only after clearing stale reset history, then require three consecutive
+  // healthy samples so a transient lock/ready indication cannot start a run.
+  (void)ReadRegister(handle, dt5730_status::kPllUnlockResetRegister);
+
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+  unsigned consecutive_healthy = 0U;
+  uint32_t last_status_raw = 0U;
+  uint32_t last_failure_raw = 0U;
+  do {
+    CheckSetupCancellation();
+    last_status_raw =
+        ReadRegister(handle, dt5730_status::kAcquisitionStatusRegister);
+    last_failure_raw =
+        ReadRegister(handle, dt5730_status::kBoardFailureStatusRegister);
+    const auto status =
+        dt5730_status::DecodeAcquisitionStatus(last_status_raw);
+    const auto failure =
+        dt5730_status::DecodeBoardFailureStatus(last_failure_raw);
+    const bool expected_external = hardware_settings_.clock_source != 0;
+    const bool observed_external =
+        status.clock_source == dt5730_status::ClockSource::kExternal;
+
+    latest_status_register_ = last_status_raw;
+    latest_board_failure_register_ = last_failure_raw;
+
+    // These conditions are not settling states and must never be retried as
+    // though they could become a valid acquisition configuration.
+    if (status.event_full || status.channel_shutdown ||
+        status.HasTemperatureAlarm() || failure.temperature_failure ||
+        failure.adc_power_down) {
+      throw std::runtime_error(
+          "Digitizer reported a fatal board condition during setup: "
+          "acquisition_status=" + Hex32(last_status_raw) +
+          ", board_failure_status=" + Hex32(last_failure_raw));
+    }
+
+    const bool healthy = status.board_ready && status.pll_no_unlock &&
+                         !failure.Any() &&
+                         observed_external == expected_external;
+    if (healthy) {
+      ++consecutive_healthy;
+      if (consecutive_healthy >= 3U) {
+        health_readback_available_ = true;
+        std::cout << "\033[1;36m[Board Health Readback]\033[0m status="
+                  << Hex32(last_status_raw) << ", failure="
+                  << Hex32(last_failure_raw) << ", board_ready=1, pll_lock=1"
+                  << ", clock_source=" << (observed_external ? 1 : 0)
+                  << "\n";
+        return;
+      }
+    } else {
+      consecutive_healthy = 0U;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  throw std::runtime_error(
+      "Digitizer board/PLL did not become stably ready within 2 seconds: "
+      "acquisition_status=" + Hex32(last_status_raw) +
+      ", board_failure_status=" + Hex32(last_failure_raw) +
+      ", expected_clock_source=" +
+      std::to_string(hardware_settings_.clock_source));
+}
+
+void DAQManager::CheckRuntimeHealthAndStorage(int handle,
+                                              bool strict_readback,
+                                              bool require_running) {
+  ++health_check_count_;
+  bool health_read_ok = true;
+  float max_temperature = 0.0F;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (((hardware_settings_.channel_mask >> ch) & 1U) == 0U) continue;
+    uint32_t temperature_register = 0U;
+    const uint32_t address = 0x10A8U + kChannelRegisterStride * ch;
+    if (CAEN_DGTZ_ReadRegister(handle, address, &temperature_register) !=
+        CAEN_DGTZ_Success) {
+      health_read_ok = false;
+      break;
+    }
+    const uint32_t temperature_code = temperature_register & 0xFFU;
+    const float temperature = static_cast<float>(temperature_code);
+    temperature_observed_[ch] = true;
+    max_temperature_c_[ch] =
+        std::max(max_temperature_c_[ch], temperature_code);
+    max_temperature = std::max(max_temperature, temperature);
+    if (temperature >= 82.0F) {
+      std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
+      throw FatalAcquisitionError(
+          "Digitizer CH" + std::to_string(ch) +
+          " temperature reached the 82 C software shutdown limit");
+    }
+  }
+
+  uint32_t status_register = 0U;
+  uint32_t board_failure_register = 0U;
+  if (health_read_ok &&
+      CAEN_DGTZ_ReadRegister(handle,
+                             dt5730_status::kAcquisitionStatusRegister,
+                             &status_register) !=
+          CAEN_DGTZ_Success) {
+    health_read_ok = false;
+  }
+  if (health_read_ok &&
+      CAEN_DGTZ_ReadRegister(handle,
+                             dt5730_status::kBoardFailureStatusRegister,
+                             &board_failure_register) !=
+          CAEN_DGTZ_Success) {
+    health_read_ok = false;
+  }
+  if (health_read_ok) {
+    const auto status =
+        dt5730_status::DecodeAcquisitionStatus(status_register);
+    const auto board_failure =
+        dt5730_status::DecodeBoardFailureStatus(board_failure_register);
+    const bool expected_external = hardware_settings_.clock_source != 0;
+    const bool observed_external =
+        status.clock_source == dt5730_status::ClockSource::kExternal;
+    consecutive_health_read_errors_ = 0U;
+    latest_status_register_ = status_register;
+    latest_board_failure_register_ = board_failure_register;
+    latest_max_temperature_c_ = max_temperature;
+    health_readback_available_ = true;
+    if (status.event_full) {
+      throw FatalAcquisitionError(
+          "Digitizer event memory reported FULL; stopping because data-loss "
+          "integrity can no longer be guaranteed (status=" +
+          Hex32(status_register) + ")");
+    }
+    if (!status.pll_no_unlock || !status.board_ready ||
+        status.channel_shutdown || status.HasTemperatureAlarm() ||
+        board_failure.Any() || observed_external != expected_external) {
+      throw FatalAcquisitionError(
+          "Digitizer runtime board-health fault: acquisition_status=" +
+          Hex32(status_register) + ", board_failure_status=" +
+          Hex32(board_failure_register) + ", expected_clock_source=" +
+          std::to_string(hardware_settings_.clock_source));
+    }
+    if (require_running && !status.run) {
+      throw FatalAcquisitionError(
+          "Digitizer acquisition RUN status dropped while software still "
+          "expected the board to be recording");
+    }
+  } else {
+    ++consecutive_health_read_errors_;
+    ++health_read_error_count_;
+    std::cerr << "\n\033[1;33m[Warning] Runtime health-register read failed "
+              << consecutive_health_read_errors_
+              << (strict_readback ? "/1" : "/3")
+              << "; temperature protection cannot be verified\033[0m\n";
+    if (strict_readback || consecutive_health_read_errors_ >= 3U) {
+      throw FatalAcquisitionError(
+          "Runtime health-register communication failed; stopping because "
+          "temperature/status safety cannot be verified");
+    }
+  }
+
+  const uint64_t filesystem_free =
+      FilesystemFreeBytes(working_output_file_);
+  if (filesystem_free < hardware_settings_.storage.stop_free_bytes) {
+    throw FatalAcquisitionError(
+        "Output filesystem reached the configured safety watermark: free=" +
+        std::to_string(filesystem_free) + " bytes, stop_free=" +
+        std::to_string(hardware_settings_.storage.stop_free_bytes) +
+        " bytes");
+  }
+}
+
+void DAQManager::WaitForAcquisitionRunning(int handle) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(500);
+  uint32_t status_register = 0U;
+  do {
+    CAEN_CHECK(CAEN_DGTZ_ReadRegister(
+        handle, dt5730_status::kAcquisitionStatusRegister,
+        &status_register));
+    if (dt5730_status::DecodeAcquisitionStatus(status_register).run) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  throw FatalAcquisitionError(
+      "Digitizer did not assert the acquisition RUN status within 500 ms "
+      "after SWStartAcquisition");
+}
+
+void DAQManager::WriteRuntimeArtifacts() {
+  if (!config_snapshot_written_ && config_file_ != config_snapshot_file_) {
+    WriteNewAtomicFile(config_snapshot_file_, config_contents_);
+    config_snapshot_written_ = true;
+  } else if (config_file_ == config_snapshot_file_) {
+    if (ReadRequiredTextFile(config_file_, "runtime config snapshot") !=
+        config_contents_) {
+      throw std::runtime_error(
+          "Runtime config snapshot changed after it was parsed; refusing to "
+          "record provenance or continue acquisition");
+    }
+    config_snapshot_written_ = true;
+  }
+
+  // Status snapshots are immutable.  The canonical metadata path is created
+  // exactly once for a terminal state, so no path-based replacement race can
+  // substitute unvalidated bytes for an already published run record.
+  const bool terminal_status =
+      acquisition_status_ == "completed" || acquisition_status_ == "failed" ||
+      acquisition_status_ == "cancelled";
+  const std::string published_metadata_path =
+      terminal_status
+          ? metadata_file_
+          : metadata_file_ + ".status." + acquisition_status_ + ".json";
+
+  std::ostringstream metadata;
+  metadata << std::setprecision(12);
+
+  const auto timestamp = std::time(nullptr);
+  const double elapsed_time_sec =
+      trigger_time_tag_observed_
+          ? dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                          last_extended_ttt_)
+          : 0.0;
+  const double recorded_window_sum_sec =
+      dt5730_timing::RecordedWindowSumSeconds(
+          recorded_events_, hardware_settings_.record_length);
+  metadata << "{\n"
+           << "  \"schema_version\": 2,\n"
+           << "  \"run_number\": " << run_number_ << ",\n"
+           << "  \"acquisition_status\": \""
+           << JsonEscape(acquisition_status_) << "\",\n"
+           << "  \"termination_reason\": \""
+           << JsonEscape(termination_reason_) << "\",\n"
+           << "  \"requested_max_events\": " << max_events_ << ",\n"
+           << "  \"requested_run_time_sec\": " << run_time_sec_ << ",\n"
+           << "  \"hardware_verified_unix_time\": ";
+  if (hardware_verified_unix_time_ != 0) metadata << hardware_verified_unix_time_;
+  else metadata << "null";
+  metadata << ",\n  \"acquisition_start_unix_time\": ";
+  if (acquisition_start_unix_time_ != 0) metadata << acquisition_start_unix_time_;
+  else metadata << "null";
+  metadata << ",\n  \"acquisition_end_unix_time\": ";
+  if (acquisition_end_unix_time_ != 0) metadata << acquisition_end_unix_time_;
+  else metadata << "null";
+  metadata << ",\n"
+           << "  \"recorded_events\": " << recorded_events_ << ",\n"
+           << "  \"lost_events\": " << lost_events_ << ",\n"
+           << "  \"lost_events_scope\": "
+              "\"accepted_trigger_counter_gaps_through_last_observed_event\",\n"
+           << "  \"data_quality\": {\"loss_policy_evaluated\": "
+           << (loss_policy_evaluation_observed_ ? "true" : "false")
+           << ", \"observed_event_count\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_events_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"inferred_lost_event_count\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_lost_events_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"lost_fraction\": ";
+  if (loss_policy_evaluation_observed_) {
+    metadata << loss_policy_observed_lost_fraction_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"policy_exceeded\": "
+           << (loss_policy_exceeded_ ? "true" : "false")
+           << ", \"rejected_post_gap_event_persisted\": "
+           << (loss_policy_rejected_post_gap_event_ ? "false" : "null")
+           << "},\n"
+           << "  \"failure_reason\": ";
+  if (failure_reason_.empty()) metadata << "null";
+  else metadata << "\"" << JsonEscape(failure_reason_) << "\"";
+  metadata << ",\n"
+           << "  \"created_unix_time\": " << timestamp << ",\n"
+           << "  \"raw_output_path\": \""
+           << JsonEscape(raw_output_published_ ? output_file_
+                                               : working_output_file_)
+           << "\",\n"
+           << "  \"requested_raw_output_path\": \""
+           << JsonEscape(output_file_) << "\",\n"
+           << "  \"raw_output_published\": "
+           << (raw_output_published_ ? "true" : "false") << ",\n"
+           << "  \"raw_output_finalized\": "
+           << (raw_output_finalized_ ? "true" : "false") << ",\n"
+           << "  \"raw_finalization_error\": ";
+  if (raw_finalization_error_.empty()) metadata << "null";
+  else metadata << "\"" << JsonEscape(raw_finalization_error_) << "\"";
+  metadata << ",\n"
+           << "  \"raw_digest_method\": \""
+           << JsonEscape(raw_digest_method_) << "\",\n"
+           << "  \"raw_recovery_performed\": "
+           << (raw_recovery_performed_ ? "true" : "false") << ",\n"
+           << "  \"raw_events_before_recovery\": ";
+  if (raw_recovery_performed_) metadata << raw_events_before_recovery_;
+  else metadata << "null";
+  metadata << ",\n"
+           << "  \"lost_events_exact\": "
+           << (lost_events_exact_ ? "true" : "false") << ",\n"
+           << "  \"raw_format_version\": 1,\n"
+           << "  \"raw_event_header_bytes\": " << sizeof(EventHeader)
+           << ",\n"
+           << "  \"raw_event_bytes\": " << RawEventBytes(hardware_settings_)
+           << ",\n"
+           << "  \"last_complete_offset\": " << complete_raw_bytes_
+           << ",\n"
+           << "  \"raw_output_size_bytes\": ";
+  if (raw_output_finalized_) metadata << raw_output_size_bytes_;
+  else metadata << "null";
+  metadata << ",\n  \"raw_output_sha256\": ";
+  if (raw_output_finalized_) {
+    metadata << "\"" << raw_output_sha256_ << "\"";
+  } else {
+    metadata << "null";
+  }
+  metadata << ",\n"
+           << "  \"storage\": {\"free_bytes_at_start\": "
+           << output_free_bytes_at_start_
+           << ", \"free_bytes_at_end\": ";
+  if (output_free_bytes_at_end_known_) metadata << output_free_bytes_at_end_;
+  else metadata << "null";
+  metadata << ", \"expected_raw_bytes\": " << expected_raw_bytes_
+           << ", \"minimum_free_bytes\": "
+           << hardware_settings_.storage.minimum_free_bytes
+           << ", \"stop_free_bytes\": "
+           << hardware_settings_.storage.stop_free_bytes << "},\n"
+           << "  \"runtime_counters\": {\"readout_errors\": "
+           << readout_error_count_ << ", \"health_checks\": "
+           << health_check_count_ << ", \"health_read_errors\": "
+           << health_read_error_count_
+           << ", \"zmq_nonblocking_send_failures\": "
+           << zmq_send_failure_count_
+           << ", \"zmq_send_errors\": " << zmq_send_error_count_
+           << ", \"zmq_send_hwm_messages\": " << zmq_send_hwm_messages_
+           << ", \"zmq_send_hwm_approx_bytes\": "
+           << zmq_send_hwm_approx_bytes_
+           << ", \"runtime_configuration_checks\": "
+           << runtime_configuration_checks_
+           << ", \"software_random_triggers_sent\": "
+           << software_random_triggers_sent_
+           << ", \"software_random_trigger_elapsed_sec\": "
+           << software_random_trigger_elapsed_sec_
+           << ", \"software_random_trigger_effective_rate_hz\": ";
+  if (software_random_trigger_elapsed_sec_ > 0.0) {
+    metadata << (static_cast<double>(software_random_triggers_sent_) /
+                 software_random_trigger_elapsed_sec_);
+  } else {
+    metadata << "null";
+  }
+  metadata
+           << ", \"subscriber_delivery_evidence\": "
+              "\"unavailable_pub_socket_may_drop_silently\""
+           << ", \"max_temperature_c\": [";
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    if (ch != 0) metadata << ", ";
+    if (temperature_observed_[ch]) {
+      metadata << max_temperature_c_[ch];
+    } else {
+      metadata << "null";
+    }
+  }
+  metadata << "]},\n"
+           << "  \"timing_summary\": {\"first_extended_ttt\": ";
+  if (trigger_time_tag_observed_) metadata << first_extended_ttt_;
+  else metadata << "null";
+  metadata << ", \"last_extended_ttt\": ";
+  if (trigger_time_tag_observed_) metadata << last_extended_ttt_;
+  else metadata << "null";
+  metadata << ", \"elapsed_time_sec\": ";
+  if (trigger_time_tag_observed_) metadata << elapsed_time_sec;
+  else metadata << "null";
+  metadata << ", \"recorded_window_sum_sec\": "
+           << recorded_window_sum_sec
+           << ", \"recorded_window_to_elapsed_pct\": ";
+  if (elapsed_time_sec > 0.0) {
+    metadata << dt5730_timing::RecordedWindowToElapsedPercent(
+        recorded_window_sum_sec, elapsed_time_sec);
+  } else {
+    metadata << "null";
+  }
+  metadata << ", \"average_recorded_event_rate_hz\": ";
+  if (elapsed_time_sec > 0.0) {
+    metadata << dt5730_timing::AverageRecordedEventRateHz(
+        recorded_events_, elapsed_time_sec);
+  } else {
+    metadata << "null";
+  }
+  metadata << "},\n"
+           << "  \"metadata_path\": \""
+           << JsonEscape(published_metadata_path)
+           << "\",\n"
+           << "  \"config_path\": \"" << JsonEscape(config_snapshot_file_)
+           << "\",\n"
+           << "  \"config_sha256\": \"" << Sha256Hex(config_contents_)
+           << "\",\n"
+           << "  \"source_config_path\": \"" << JsonEscape(config_file_)
+           << "\",\n"
+           << "  \"binary_path\": \"" << JsonEscape(executable_path_)
+           << "\",\n"
+           << "  \"binary_sha256\": \"" << executable_sha256_ << "\",\n"
+           << "  \"git_commit\": \"" << JsonEscape(git_commit_) << "\",\n"
+           << "  \"build_timestamp\": \"" << JsonEscape(build_timestamp_)
+           << "\",\n"
+           << "  \"hardware\": {\n"
+           << "    \"connection_type\": \""
+           << JsonEscape(hardware_settings_.connection.type) << "\",\n"
+           << "    \"connection_link\": "
+           << hardware_settings_.connection.link << ",\n"
+           << "    \"connection_node\": "
+           << hardware_settings_.connection.node << ",\n"
+           << "    \"connection_base_address\": "
+           << hardware_settings_.connection.base_address << ",\n"
+           << "    \"expected_model\": \""
+           << JsonEscape(hardware_settings_.connection.expected_model)
+           << "\",\n"
+           << "    \"expected_serial\": ";
+  if (hardware_settings_.connection.has_expected_serial) {
+    metadata << hardware_settings_.connection.expected_serial;
+  } else {
+    metadata << "null";
+  }
+  metadata << ",\n"
+           << "    \"model\": \"" << JsonEscape(board_model_) << "\",\n"
+           << "    \"serial_number\": " << board_serial_number_ << ",\n"
+           << "    \"roc_firmware\": \""
+           << JsonEscape(board_roc_firmware_) << "\",\n"
+           << "    \"amc_firmware\": \""
+           << JsonEscape(board_amc_firmware_) << "\",\n"
+           << "    \"input_range_mvpp\": "
+           << hardware_settings_.input_range_mv << ",\n"
+           << "    \"adc_bits\": " << board_adc_bits_ << ",\n"
+           << "    \"dc_offset_dac_bits\": 16,\n"
+           << "    \"dc_offset_target_tolerance_percent\": "
+           << hardware_settings_.dc_offset_calibration
+                  .target_tolerance_percent
+           << ",\n"
+           << "    \"dc_offset_max_adjustment_iterations\": "
+           << hardware_settings_.dc_offset_calibration
+                  .max_adjustment_iterations
+           << ",\n"
+           << "    \"dc_offset_dac_busy_timeout_ms\": "
+           << hardware_settings_.dc_offset_calibration.dac_busy_timeout_ms
+           << ",\n"
+           << "    \"dc_offset_step_settling_time_ms\": "
+           << hardware_settings_.dc_offset_calibration.step_settling_time_ms
+           << ",\n"
+           << "    \"trigger_time_tag_raw_lsb_ns\": "
+           << dt5730_timing::kTriggerTimeTagRawLsbNs << ",\n"
+           << "    \"trigger_time_tag_observable_resolution_ns\": "
+           << dt5730_timing::kTriggerTimeTagObservableResolutionNs << ",\n"
+           << "    \"adc_sample_period_ns\": "
+           << dt5730_timing::kAdcSamplePeriodNs << ",\n"
+           << "    \"dead_time_measurement_available\": false,\n"
+           << "    \"dead_time_method\": "
+              "\"unavailable_no_hardware_busy_or_livetime_scaler\",\n"
+           << "    \"latest_acquisition_status_register\": "
+           << latest_status_register_ << ",\n"
+           << "    \"latest_board_failure_status_register\": "
+           << latest_board_failure_register_ << ",\n"
+           << "    \"waveform_dsp_schema\": "
+           << cpnr::kWaveformDspCurrentSchema << ",\n"
+           << "    \"dsp_charge_anchor\": \""
+           << cpnr::kPeakCenteredChargeAnchor << "\",\n"
+           << "    \"dsp_charge_window_pre_ns\": "
+           << cpnr::kPeakCenteredChargePreNs << ",\n"
+           << "    \"dsp_charge_window_post_ns\": "
+           << cpnr::kPeakCenteredChargePostNs << ",\n"
+           << "    \"dsp_charge_window_samples\": "
+           << cpnr::kPeakCenteredChargeWindowSamples << ",\n"
+           << "    \"dsp_short_charge_semantics\": \""
+           << cpnr::kPeakCenteredShortChargeSemantics << "\",\n"
+           << "    \"dsp_pulse_time_semantics\": \""
+           << cpnr::kPeakCenteredPulseTimeSemantics << "\",\n"
+           << "    \"dsp_baseline_samples\": "
+           << hardware_settings_.software_dsp.waveform.baseline_samples
+           << ",\n"
+           << "    \"dsp_short_gate_samples\": "
+           << hardware_settings_.software_dsp.waveform.short_gate_samples
+           << ",\n"
+           << "    \"dsp_long_gate_samples\": "
+           << hardware_settings_.software_dsp.waveform.long_gate_samples
+           << ",\n"
+           << "    \"dsp_pulse_start_threshold_adc\": "
+           << hardware_settings_.software_dsp.waveform
+                  .pulse_start_threshold_adc
+           << ",\n"
+           << "    \"software_coincidence_window_ns\": "
+           << hardware_settings_.software_dsp.coincidence_window_ns << ",\n"
+           << "    \"max_lost_events\": "
+           << hardware_settings_.lost_event_policy.max_lost_events << ",\n"
+           << "    \"max_lost_fraction\": "
+           << hardware_settings_.lost_event_policy.max_lost_fraction << ",\n"
+           << "    \"clock_source\": " << hardware_settings_.clock_source
+           << ",\n"
+           << "    \"clock_source_readback\": "
+           << clock_source_readback_ << ",\n"
+           << "    \"run_sync_mode\": " << hardware_settings_.run_sync_mode
+           << ",\n"
+           << "    \"run_sync_mode_readback\": "
+           << run_sync_mode_readback_ << ",\n"
+           << "    \"trigger_polarity\": \""
+           << (hardware_settings_.trigger_polarity == 1 ? "falling" : "rising")
+           << "\",\n"
+           << "    \"record_mask\": " << hardware_settings_.channel_mask
+           << ",\n"
+           << "    \"record_mask_readback\": "
+           << channel_mask_readback_ << ",\n"
+           << "    \"record_length\": " << hardware_settings_.record_length
+           << ",\n"
+           << "    \"record_length_granularity_samples\": "
+           << dt5730_constraints::kRecordLengthGranularitySamples << ",\n"
+           << "    \"post_trigger_percent\": "
+           << hardware_settings_.post_trigger << ",\n"
+           << "    \"post_trigger_readback_percent\": "
+           << post_trigger_readback_ << ",\n"
+           << "    \"external_trigger_mode\": "
+           << hardware_settings_.ext_trigger_mode << ",\n"
+           << "    \"self_trigger_mode\": "
+           << hardware_settings_.self_trigger_mode << ",\n"
+           << "    \"software_random_trigger_mode\": "
+           << hardware_settings_.software_random_trigger_mode << ",\n"
+           << "    \"software_random_trigger_rate_hz\": "
+           << hardware_settings_.software_random_trigger_rate_hz << ",\n"
+           << "    \"software_random_trigger_seed\": ";
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    metadata << software_random_trigger_seed_;
+  } else {
+    metadata << "null";
+  }
+  metadata << ",\n"
+           << "    \"self_trigger_mask\": "
+           << hardware_settings_.self_trigger_mask << ",\n"
+           << "    \"pair_logic\": \""
+           << (hardware_settings_.pair_logic == DAQPairLogic::kAnd ? "AND" : "OR")
+           << "\",\n"
+           << "    \"explicit_trigger_routing\": "
+           << (hardware_settings_.explicit_trigger_routing ? "true" : "false")
+           << ",\n"
+           << "    \"global_trigger_mask_readback\": "
+           << global_trigger_mask_readback_ << ",\n"
+           << "    \"pair_logic_readback\": [";
+  for (std::size_t pair = 0; pair < pair_logic_readback_.size(); ++pair) {
+    if (pair != 0U) metadata << ", ";
+    metadata << pair_logic_readback_[pair];
+  }
+  metadata << "]\n  },\n  \"channels\": [\n";
+
+  bool first_channel = true;
+  for (int ch = 0; ch < MAX_CH; ++ch) {
+    const auto& runtime = runtime_channels_[ch];
+    if (!runtime.enabled) continue;
+    if (!first_channel) metadata << ",\n";
+    first_channel = false;
+    metadata << "    {\"channel\": " << ch
+             << ", \"trigger_enabled\": "
+             << (runtime.participates_in_trigger ? "true" : "false")
+             << ", \"input_range_register\": "
+             << runtime.input_range_register
+             << ", \"input_range_readback\": "
+             << runtime.input_range_readback
+             << ", \"requested_dc_offset\": "
+             << runtime.requested_dc_offset
+             << ", \"readback_dc_offset\": "
+             << runtime.readback_dc_offset
+             << ", \"dc_offset_mode\": \""
+             << (runtime.dc_offset_target_mode
+                     ? "target_baseline_percent"
+                     : "raw_dac_code")
+             << "\", \"requested_baseline_percent\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << runtime.requested_baseline_percent;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"target_baseline_adc\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << runtime.target_baseline_adc;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"initial_dc_offset_dac\": "
+             << runtime.initial_dc_offset_dac
+             << ", \"final_dc_offset_dac\": "
+             << runtime.final_dc_offset_dac
+             << ", \"baseline_error_adc\": ";
+    if (runtime.dc_offset_target_mode && runtime.baseline_measured) {
+      metadata << runtime.baseline_error_adc;
+    } else {
+      metadata << "null";
+    }
+    metadata << ", \"dc_offset_adjustment_iterations\": "
+             << runtime.dc_offset_adjustment_iterations
+             << ", \"dc_offset_converged\": ";
+    if (runtime.dc_offset_target_mode) {
+      metadata << (runtime.dc_offset_converged ? "true" : "false");
+    } else {
+      metadata << "null";
+    }
+    metadata
+             << ", \"polarity_readback\": \""
+             << (runtime.polarity_readback == 1 ? "falling" : "rising")
+             << "\", \"threshold_mode\": \""
+             << (!runtime.threshold_programmed
+                     ? "not_used_record_only"
+                     : (runtime.measured_threshold
+                            ? "baseline_relative_mv"
+                            : "legacy_absolute_adc"))
+             << "\", \"measured_baseline_adc\": ";
+    if (runtime.baseline_measured) metadata << runtime.measured_baseline_adc;
+    else metadata << "null";
+    metadata << ", \"requested_threshold_mv\": ";
+    if (runtime.measured_threshold) metadata << runtime.requested_threshold_mv;
+    else metadata << "null";
+    metadata << ", \"delta_adc\": ";
+    if (runtime.measured_threshold) metadata << runtime.delta_adc;
+    else metadata << "null";
+    metadata << ", \"written_threshold_adc\": ";
+    if (runtime.threshold_programmed) metadata << runtime.written_threshold_adc;
+    else metadata << "null";
+    metadata << ", \"readback_threshold_adc\": ";
+    if (runtime.threshold_programmed) metadata << runtime.readback_threshold_adc;
+    else metadata << "null";
+    metadata << ", \"effective_threshold_mv\": ";
+    if (runtime.measured_threshold) metadata << runtime.effective_threshold_mv;
+    else metadata << "null";
+    metadata << "}";
+  }
+  metadata << "\n  ]\n}\n";
+  if (!metadata) {
+    throw std::runtime_error("Failed while composing runtime metadata");
+  }
+  WriteNewAtomicFile(published_metadata_path, metadata.str());
+
+  std::cout << "\033[1;32m[Run Provenance]\033[0m config snapshot="
+            << config_snapshot_file_ << ", metadata="
+            << published_metadata_path
+            << ", run=" << run_number_ << "\n";
+}
+
+void DAQManager::FinalizeRawOutput(bool truncate_to_complete_prefix) {
+  if (raw_output_finalized_) return;
+  if (!output_stream_) {
+    throw FatalAcquisitionError(
+        "Raw output stream is unavailable during finalization");
+  }
+  if (raw_output_digest_.SizeBytes() != complete_raw_bytes_) {
+    throw FatalAcquisitionError(
+        "Streaming raw digest byte count differs from the last complete "
+        "event boundary");
+  }
+
+  const int stream_descriptor = ::fileno(output_stream_);
+  if (stream_descriptor < 0) {
+    throw FatalAcquisitionError(
+        "Cannot obtain the raw output descriptor during finalization");
+  }
+  const int finalization_descriptor = ::dup(stream_descriptor);
+  if (finalization_descriptor < 0) {
+    throw FatalAcquisitionError(
+        "Cannot preserve the raw output descriptor during finalization (" +
+        std::string(std::strerror(errno)) + ")");
+  }
+
+  bool descriptor_open = true;
+  try {
+    // Always attempt to drain the stdio buffer.  On failure, the descriptor's
+    // actual length decides the recoverable boundary; never extend a short
+    // file with zeroes to the intended byte count.
+    const int flush_result = ::fflush(output_stream_);
+    const int close_result = ::fclose(output_stream_);
+    output_stream_ = nullptr;
+
+    const bool stream_error = flush_result != 0 || close_result != 0;
+    struct stat pre_sync_status {};
+    if (::fstat(finalization_descriptor, &pre_sync_status) != 0 ||
+        pre_sync_status.st_size < 0 ||
+        static_cast<uint64_t>(pre_sync_status.st_dev) != output_device_ ||
+        static_cast<uint64_t>(pre_sync_status.st_ino) != output_inode_) {
+      throw FatalAcquisitionError(
+          "Cannot inspect the raw output after closing its write stream");
+    }
+
+    const uint64_t event_bytes = RawEventBytes(hardware_settings_);
+    const uint64_t observed_bytes =
+        static_cast<uint64_t>(pre_sync_status.st_size);
+    const uint64_t bounded_bytes =
+        std::min(observed_bytes, complete_raw_bytes_);
+    const uint64_t recoverable_bytes =
+        bounded_bytes - (bounded_bytes % event_bytes);
+    const bool size_recovery_needed =
+        observed_bytes != complete_raw_bytes_;
+    if (stream_error) {
+      raw_recovery_performed_ = true;
+      raw_events_before_recovery_ = recorded_events_;
+    }
+    if (size_recovery_needed) {
+      if (recoverable_bytes > observed_bytes) {
+        throw FatalAcquisitionError(
+            "Internal error: raw recovery would extend the output file");
+      }
+      if (::ftruncate(finalization_descriptor,
+                      static_cast<off_t>(recoverable_bytes)) != 0) {
+        throw FatalAcquisitionError(
+            "Cannot truncate failed raw output to its last complete event (" +
+            std::string(std::strerror(errno)) + ")");
+      }
+      raw_recovery_performed_ = true;
+      raw_events_before_recovery_ = recorded_events_;
+      complete_raw_bytes_ = recoverable_bytes;
+      recorded_events_ = recoverable_bytes / event_bytes;
+      // The running counter may include board-counter gaps observed only in
+      // events that could not be made durable.
+      lost_events_exact_ = false;
+    }
+
+    if (::fsync(finalization_descriptor) != 0) {
+      throw FatalAcquisitionError(
+          "Raw output sync failed; run is marked failed (" +
+          std::string(std::strerror(errno)) + ")");
+    }
+    // Once writing is complete, make accidental pathname-based modification
+    // fail before authenticating and publishing the inode.  The retained
+    // failed-run prefix remains readable by the owner/group for salvage.
+    if (::fchmod(finalization_descriptor, S_IRUSR | S_IRGRP) != 0 ||
+        ::fsync(finalization_descriptor) != 0) {
+      throw FatalAcquisitionError(
+          "Cannot make the finalized raw inode read-only and durable (" +
+          std::string(std::strerror(errno)) + ")");
+    }
+    if (!PathMatchesIdentity(working_output_file_,
+                             {output_device_, output_inode_})) {
+      throw FatalAcquisitionError(
+          "Raw output path changed during acquisition; run is marked failed");
+    }
+
+    struct stat raw_status {};
+    if (::fstat(finalization_descriptor, &raw_status) != 0 ||
+        raw_status.st_size < 0 ||
+        static_cast<uint64_t>(raw_status.st_dev) != output_device_ ||
+        static_cast<uint64_t>(raw_status.st_ino) != output_inode_) {
+      throw FatalAcquisitionError(
+          "Cannot verify the finalized raw output inode and size");
+    }
+    if (static_cast<uint64_t>(raw_status.st_size) != complete_raw_bytes_) {
+      throw FatalAcquisitionError(
+          "Finalized raw output size differs from the last complete event "
+          "boundary: expected " + std::to_string(complete_raw_bytes_) +
+          ", observed " + std::to_string(raw_status.st_size));
+    }
+
+    // Authenticate the exact synced inode, not merely the bytes submitted to
+    // stdio.  The streaming digest remains an independent in-process check;
+    // the descriptor digest also detects same-inode modification through the
+    // visible .partial pathname before publication.
+    raw_output_size_bytes_ = complete_raw_bytes_;
+    struct stat before_hash_status {};
+    if (::fstat(finalization_descriptor, &before_hash_status) != 0) {
+      throw FatalAcquisitionError(
+          "Cannot snapshot raw inode identity before descriptor hashing");
+    }
+    raw_output_sha256_ = Sha256FileDescriptorHex(
+        finalization_descriptor, raw_output_size_bytes_);
+    struct stat after_hash_status {};
+    if (::fstat(finalization_descriptor, &after_hash_status) != 0 ||
+        before_hash_status.st_dev != after_hash_status.st_dev ||
+        before_hash_status.st_ino != after_hash_status.st_ino ||
+        before_hash_status.st_size != after_hash_status.st_size ||
+        before_hash_status.st_mtim.tv_sec !=
+            after_hash_status.st_mtim.tv_sec ||
+        before_hash_status.st_mtim.tv_nsec !=
+            after_hash_status.st_mtim.tv_nsec ||
+        before_hash_status.st_ctim.tv_sec !=
+            after_hash_status.st_ctim.tv_sec ||
+        before_hash_status.st_ctim.tv_nsec !=
+            after_hash_status.st_ctim.tv_nsec ||
+        !PathMatchesIdentity(working_output_file_,
+                             {output_device_, output_inode_})) {
+      throw FatalAcquisitionError(
+          "Raw inode changed while its descriptor SHA-256 was computed");
+    }
+    if (raw_output_digest_.SizeBytes() == raw_output_size_bytes_) {
+      if (raw_output_sha256_ != raw_output_digest_.FinalHex()) {
+        throw FatalAcquisitionError(
+            "Final raw descriptor digest differs from the streaming write "
+            "digest");
+      }
+      raw_digest_method_ =
+          "streaming_sha256_verified_by_descriptor_sha256";
+    } else {
+      raw_digest_method_ = "recovered_descriptor_sha256";
+    }
+    SyncParentDirectory(working_output_file_);
+    output_free_bytes_at_end_ = FilesystemFreeBytes(working_output_file_);
+    output_free_bytes_at_end_known_ = true;
+
+    if (!truncate_to_complete_prefix && !stream_error &&
+        !size_recovery_needed) {
+      bool final_link_created = false;
+      try {
+        LinkDescriptorNoReplace(finalization_descriptor, output_file_,
+                                "final raw output");
+        final_link_created = true;
+        if (!PathMatchesIdentity(output_file_,
+                                 {output_device_, output_inode_})) {
+          throw FatalAcquisitionError(
+              "Published raw output identity differs from the acquired inode");
+        }
+        SyncParentDirectory(output_file_);
+        raw_output_published_ = true;
+      } catch (...) {
+        if (final_link_created) {
+          RemoveIfSameFile(output_file_, {output_device_, output_inode_});
+          try {
+            SyncParentDirectory(output_file_);
+          } catch (...) {
+          }
+        }
+        throw;
+      }
+
+      if (!RemoveIfSameFile(working_output_file_,
+                            {output_device_, output_inode_})) {
+        std::cerr << "[Run Provenance] Final raw output is durable, but the "
+                     "partial-name cleanup was unsafe or failed: "
+                  << working_output_file_ << "\n";
+      } else {
+        try {
+          SyncParentDirectory(output_file_);
+        } catch (const std::exception& cleanup_error) {
+          std::cerr << "[Run Provenance] Final raw output is durable, but "
+                       "partial-name cleanup sync failed: "
+                    << cleanup_error.what() << "\n";
+        }
+      }
+    }
+
+    if (::close(finalization_descriptor) != 0) {
+      std::cerr << "[Run Provenance] Raw bytes are synced, but closing the "
+                   "duplicate finalization descriptor failed: "
+                << std::strerror(errno) << "\n";
+    }
+    descriptor_open = false;
+    raw_output_finalized_ = true;
+    raw_finalization_error_.clear();
+    std::cout << "\n\033[1;32m[Run Provenance]\033[0m raw_size="
+              << raw_output_size_bytes_ << " bytes, raw_sha256="
+              << raw_output_sha256_ << ", events=" << recorded_events_
+              << ((truncate_to_complete_prefix || stream_error ||
+                   size_recovery_needed)
+                      ? " (failed-run prefix)"
+                      : "")
+              << "\n";
+    if (!truncate_to_complete_prefix &&
+        (stream_error || size_recovery_needed)) {
+      throw FatalAcquisitionError(
+          "Raw output flush/size verification failed; only the complete "
+          "descriptor prefix was recovered and authenticated");
+    }
+  } catch (...) {
+    if (output_stream_) {
+      ::fclose(output_stream_);
+      output_stream_ = nullptr;
+    }
+    if (descriptor_open) ::close(finalization_descriptor);
+    throw;
+  }
 }
 
 void DAQManager::Start(std::atomic<bool>& is_running) {
+  if (acquisition_status_ != "hardware_verified_not_started") {
+    throw std::logic_error(
+        "DAQManager::Start can be called exactly once after verified setup");
+  }
   std::cout << "\033[1;32m[DAQManager]\033[0m Starting Acquisition...\n";
   std::cout << " - Stop Condition : ";
   if (max_events_ > 0) std::cout << max_events_ << " Events\n";
   else if (run_time_sec_ > 0) std::cout << run_time_sec_ << " Seconds\n";
   else std::cout << "Unlimited (Manual Stop)\n";
+  if (hardware_settings_.software_random_trigger_mode != 0) {
+    std::cout << " - Trigger Source  : Software Random (Poisson, mean "
+              << std::fixed << std::setprecision(6)
+              << hardware_settings_.software_random_trigger_rate_hz
+              << " Hz)\n";
+  }
 
-  CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_.GetHandle()));
-  AcquisitionLoop(is_running);
+  const auto finalize_prestart_cancellation = [&]() {
+    termination_reason_ = "cancelled_before_start";
+    acquisition_status_ = "cancelled";
+    acquisition_end_unix_time_ = std::time(nullptr);
+    FinalizeRawOutput(true);
+    WriteRuntimeArtifacts();
+    std::cout << "\033[1;33m[DAQManager]\033[0m Acquisition was cancelled "
+                 "before the hardware start command.\n";
+  };
+  if (!is_running.load(std::memory_order_relaxed)) {
+    finalize_prestart_cancellation();
+    return;
+  }
+
+  bool acquisition_started = false;
+  const auto record_failed_run = [&](const std::string& primary_error) {
+    running_ = false;
+    failure_reason_ = primary_error;
+    if (acquisition_started) {
+      const auto stop_error = CAEN_DGTZ_SWStopAcquisition(digitizer_->GetHandle());
+      if (stop_error != CAEN_DGTZ_Success) {
+        failure_reason_ += "; digitizer stop after failure also failed: error code " +
+                           std::to_string(stop_error) + "; recovery required";
+        std::cerr << "[Recovery Required] Failed to stop digitizer after run error: "
+                  << static_cast<int>(stop_error)
+                  << "; use digitizer recovery before the next run.\n";
+      }
+      acquisition_started = false;
+    }
+    termination_reason_ = "failure";
+    acquisition_end_unix_time_ = std::time(nullptr);
+    try {
+      FinalizeRawOutput(true);
+    } catch (const std::exception& finalization_error) {
+      raw_finalization_error_ = finalization_error.what();
+      failure_reason_ += "; raw prefix finalization also failed: " +
+                         raw_finalization_error_;
+    }
+    acquisition_status_ = "failed";
+    try {
+      WriteRuntimeArtifacts();
+    } catch (const std::exception& metadata_error) {
+      std::cerr << "\n[Run Provenance] Cannot record failed status: "
+                << metadata_error.what() << "\n";
+    }
+  };
+  try {
+    VerifyAcquisitionStartCapacity();
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, false);
+    VerifyRuntimeConfiguration(digitizer_->GetHandle());
+    if (!is_running.load(std::memory_order_relaxed)) {
+      finalize_prestart_cancellation();
+      return;
+    }
+    CAEN_CHECK(CAEN_DGTZ_SWStartAcquisition(digitizer_->GetHandle()));
+    acquisition_started = true;
+    WaitForAcquisitionRunning(digitizer_->GetHandle());
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, true);
+    acquisition_start_unix_time_ = std::time(nullptr);
+    running_ = true;
+    termination_reason_ = "running";
+    acquisition_status_ = "running";
+    failure_reason_.clear();
+    WriteRuntimeArtifacts();
+    AcquisitionLoop(is_running);
+    acquisition_started = false;
+    running_ = false;
+    CheckRuntimeHealthAndStorage(digitizer_->GetHandle(), true, false);
+    VerifyRuntimeConfiguration(digitizer_->GetHandle());
+    acquisition_end_unix_time_ = std::time(nullptr);
+    FinalizeRawOutput(false);
+    acquisition_status_ = "completed";
+    failure_reason_.clear();
+    WriteRuntimeArtifacts();
+  } catch (const std::exception& error) {
+    record_failed_run(error.what());
+    throw;
+  } catch (...) {
+    record_failed_run("unknown non-standard exception");
+    throw;
+  }
 }
 
 void DAQManager::Stop() {
@@ -182,185 +3040,521 @@ void DAQManager::Stop() {
 }
 
 void DAQManager::AcquisitionLoop(std::atomic<bool>& is_running) {
-  EventHeader *header = reinterpret_cast<EventHeader *>(raw_buffer_pool_.data());
-  uint16_t *wave_dest = reinterpret_cast<uint16_t *>(raw_buffer_pool_.data() + sizeof(EventHeader));
+  EventHeader header{};
   
-  int handle = digitizer_.GetHandle();
-  char *caen_buffer = digitizer_.GetReadoutBuffer();
-  CAEN_DGTZ_UINT16_EVENT_t *caen_event = digitizer_.GetDecodedEvent();
-  
-  uint32_t event_count = 0;
-  const uint32_t TTT_MASK = 0x7FFFFFFF;
+  int handle = digitizer_->GetHandle();
+  char *caen_buffer = digitizer_->GetReadoutBuffer();
+  CAEN_DGTZ_UINT16_EVENT_t *caen_event = digitizer_->GetDecodedEvent();
   
   bool is_first_event = true;
-  uint32_t first_ttt = 0, current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
-  uint64_t ttt_rollovers = 0, lost_events = 0;
+  uint32_t current_ttt = 0, prev_ttt = 0, prev_event_counter = 0;
+  uint64_t ttt_rollovers = 0;
 
   auto start_time = std::chrono::steady_clock::now();
+  const bool software_random_trigger =
+      hardware_settings_.software_random_trigger_mode != 0;
+  std::mt19937_64 random_trigger_engine(software_random_trigger_seed_);
+  std::exponential_distribution<double> random_trigger_interval(
+      software_random_trigger
+          ? hardware_settings_.software_random_trigger_rate_hz
+          : 1.0);
+  auto next_random_trigger = start_time;
+  const auto schedule_next_random_trigger =
+      [&](std::chrono::steady_clock::time_point from) {
+        auto interval = std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(
+                random_trigger_interval(random_trigger_engine)));
+        if (interval <= std::chrono::steady_clock::duration::zero()) {
+          interval = std::chrono::steady_clock::duration{1};
+        }
+        next_random_trigger = from + interval;
+      };
+  if (software_random_trigger) {
+    schedule_next_random_trigger(start_time);
+  }
   auto last_log_time = start_time;
-  uint32_t log_events = 0, zmq_drops = 0, loop_counter = 0;
+  auto last_health_check = start_time;
+  auto last_configuration_check = start_time;
+  // ReadData drains the events available at that read boundary.  Retain the
+  // earliest possible occurrence time for the last accepted event (the
+  // preceding drain boundary), rather than assuming that two host decode
+  // timestamps upper-bound their hardware-event separation.  The latter is
+  // false when multiple events were buffered during a host stall.
+  auto previous_read_completed_time = start_time;
+  auto last_event_earliest_time = start_time;
+  uint32_t log_events = 0, zmq_send_failures = 0, loop_counter = 0;
+  uint32_t consecutive_readout_errors = 0;
   size_t total_bytes_written = 0, last_bytes_written = 0; 
 
-  while (is_running) {
-    if (max_events_ > 0 && (int)event_count >= max_events_) break;
-    
-    auto now = std::chrono::steady_clock::now();
-    double current_elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-    if (run_time_sec_ > 0 && current_elapsed_sec >= run_time_sec_) break;
+  while (is_running && running_) {
+    if (max_events_ > 0 &&
+        recorded_events_ >= static_cast<uint64_t>(max_events_)) {
+      termination_reason_ = "event_limit";
+      break;
+    }
+    if (run_time_sec_ > 0) {
+      auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= run_time_sec_) {
+        termination_reason_ = "time_limit";
+        break;
+      }
+    }
+
+    const auto loop_now = std::chrono::steady_clock::now();
+    if (software_random_trigger) {
+      software_random_trigger_elapsed_sec_ =
+          std::chrono::duration<double>(loop_now - start_time).count();
+      if (loop_now >= next_random_trigger) {
+        CAEN_CHECK(CAEN_DGTZ_SendSWtrigger(handle));
+        ++software_random_triggers_sent_;
+        // Schedule from the actual send time. Host/readout stalls therefore
+        // reduce the effective rate instead of creating a dangerous catch-up
+        // burst of backlogged software triggers.
+        schedule_next_random_trigger(loop_now);
+      }
+    }
 
     uint32_t bsize = 0; 
 
     try {
       CAEN_CHECK(CAEN_DGTZ_ReadData(handle, CAEN_DGTZ_SLAVE_TERMINATED_READOUT_MBLT, caen_buffer, &bsize));
-      
-      if (bsize > 0) {
+      consecutive_readout_errors = 0;
+    } catch (const std::exception& e) {
+      ++consecutive_readout_errors;
+      ++readout_error_count_;
+      std::cerr << "\n\033[1;33m[Warning] Readout error "
+                << consecutive_readout_errors << "/3: \033[0m"
+                << e.what() << "\n";
+      if (consecutive_readout_errors >= 3U) {
+        CAEN_DGTZ_SWStopAcquisition(handle);
+        throw FatalAcquisitionError(
+            "Persistent CAEN readout failure after 3 consecutive errors: " +
+            std::string(e.what()));
+      }
+      continue;
+    }
+
+    const auto read_completed_time = std::chrono::steady_clock::now();
+    const auto current_batch_earliest_time = previous_read_completed_time;
+    previous_read_completed_time = read_completed_time;
+
+    if (bsize == 0U) {
+      auto wake_time = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(1);
+      if (software_random_trigger && next_random_trigger < wake_time) {
+        wake_time = next_random_trigger;
+      }
+      if (wake_time > std::chrono::steady_clock::now()) {
+        std::this_thread::sleep_until(wake_time);
+      }
+    }
+
+    try {
+      if (bsize > 0U) {
         uint32_t num_events = 0;
         CAEN_CHECK(CAEN_DGTZ_GetNumEvents(handle, caen_buffer, bsize, &num_events));
+        if (num_events == 0U) {
+          throw FatalAcquisitionError(
+              "CAEN reported a non-empty readout block containing zero events");
+        }
 
         for (uint32_t i = 0; i < num_events; ++i) {
-          CAEN_DGTZ_EventInfo_t evt_info;
+          // A single CAEN transfer can contain many events.  Enforce every
+          // stop condition at the event boundary so -n N always produces
+          // exactly N complete records and operator stop does not drain a
+          // potentially large stale block.
+          if (!is_running.load(std::memory_order_relaxed) ||
+              !running_.load(std::memory_order_relaxed)) {
+            termination_reason_ = "operator_stop";
+            break;
+          }
+          if (max_events_ > 0 &&
+              recorded_events_ >= static_cast<uint64_t>(max_events_)) {
+            termination_reason_ = "event_limit";
+            break;
+          }
+          if (run_time_sec_ > 0 &&
+              std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now() - start_time).count() >=
+                  run_time_sec_) {
+            termination_reason_ = "time_limit";
+            break;
+          }
+          CAEN_DGTZ_EventInfo_t evt_info{};
           char *evt_ptr = nullptr;
           CAEN_CHECK(CAEN_DGTZ_GetEventInfo(handle, caen_buffer, bsize, i, &evt_info, &evt_ptr));
+          VerifyCaenStandardEventHeader(evt_ptr, evt_info.EventSize, caen_buffer,
+                                        bsize, i, num_events, "Digitizer");
           CAEN_CHECK(CAEN_DGTZ_DecodeEvent(handle, evt_ptr, (void **)&caen_event));
-
-          current_ttt = evt_info.TriggerTimeTag & TTT_MASK;
-          uint32_t current_event_counter = ((uint32_t*)evt_ptr)[2] & 0xFFFFFF;
-
-          if (is_first_event) {
-              first_ttt = current_ttt; prev_ttt = current_ttt; prev_event_counter = current_event_counter; is_first_event = false;
-          } else {
-              if (current_ttt < prev_ttt) ttt_rollovers++;
-              uint32_t diff = (current_event_counter - prev_event_counter) & 0xFFFFFF;
-              if (diff > 1) lost_events += (diff - 1); 
+          if (caen_event == nullptr) {
+            throw FatalAcquisitionError(
+                "CAEN decode reported success but returned a null event");
           }
-          prev_ttt = current_ttt; prev_event_counter = current_event_counter;
+
+          const uint32_t candidate_ttt =
+              evt_info.TriggerTimeTag & dt5730_timing::kTriggerTimeTagMask;
+          const uint32_t current_event_counter =
+              evt_info.EventCounter & 0xFFFFFFU;
 
           uint32_t actual_trace_size = 0;
           for (int ch = 0; ch < MAX_CH; ++ch) {
               if ((evt_info.ChannelMask >> ch) & 1) { actual_trace_size = caen_event->ChSize[ch]; break; }
           }
+          if (actual_trace_size == 0U ||
+              actual_trace_size != hardware_settings_.record_length ||
+              evt_info.ChannelMask != hardware_settings_.channel_mask) {
+            throw FatalAcquisitionError(
+                "Decoded event channel mask/record length does not match the "
+                "configured acquisition shape");
+          }
+          for (int ch = 0; ch < MAX_CH; ++ch) {
+            if (((evt_info.ChannelMask >> ch) & 1U) == 0U) continue;
+            if (caen_event->ChSize[ch] != actual_trace_size) {
+              throw FatalAcquisitionError(
+                  "Decoded event has inconsistent active-channel trace sizes");
+            }
+            if (caen_event->DataChannel[ch] == nullptr) {
+              throw FatalAcquisitionError(
+                  "Decoded active CH" + std::to_string(ch) +
+                  " waveform pointer is null");
+            }
+          }
 
-          std::memset(header, 0, sizeof(EventHeader));
-          header->ExtendedTTT = (ttt_rollovers << 31) | current_ttt;
-          header->EventID = event_count++;
-          header->RecordLength = actual_trace_size; 
-          header->ChannelMask = evt_info.ChannelMask;
-          header->Pattern = evt_info.Pattern;
-          header->BoardEventCounter = current_event_counter;
+          if (recorded_events_ >
+              static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw FatalAcquisitionError(
+                "EventID reached the raw-format 32-bit limit; start a new "
+                "run before continuing acquisition");
+          }
+          uint64_t candidate_rollovers = ttt_rollovers;
+          uint64_t candidate_extended_ttt = candidate_ttt;
+          uint64_t prospective_lost_events = lost_events_;
+          if (!is_first_event) {
+            const double event_gap_upper_bound_seconds =
+                std::chrono::duration<double>(read_completed_time -
+                                              last_event_earliest_time)
+                    .count();
+            const auto ttt_extension = dt5730_timing::ExtendTriggerTimeTag(
+                prev_ttt, candidate_ttt, ttt_rollovers,
+                event_gap_upper_bound_seconds);
+            switch (ttt_extension.status) {
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kOk:
+                candidate_rollovers = ttt_extension.rollover_count;
+                candidate_extended_ttt = ttt_extension.extended_value;
+                break;
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kRepeated:
+                throw FatalAcquisitionError(
+                    "Digitizer TriggerTimeTag repeated; refusing ambiguous or "
+                    "duplicate timing data");
+              case dt5730_timing::TriggerTimeTagExtensionStatus::
+                  kWrapCountAmbiguous:
+                throw FatalAcquisitionError(
+                    "TriggerTimeTag extension is ambiguous because the "
+                    "conservative event-time upper bound reached the 31-bit "
+                    "counter full scale; use 48-bit Extended TTT for this run "
+                    "mode");
+              case dt5730_timing::TriggerTimeTagExtensionStatus::kOverflow:
+                throw FatalAcquisitionError(
+                    "Extended TriggerTimeTag overflowed uint64_t");
+            }
+            const uint32_t counter_difference =
+                (current_event_counter - prev_event_counter) & 0xFFFFFFU;
+            if (counter_difference == 0U) {
+              throw FatalAcquisitionError(
+                  "Digitizer event counter repeated; refusing to record a "
+                  "duplicate or stale event");
+            }
+            if (counter_difference >= 0x800000U) {
+              throw FatalAcquisitionError(
+                  "Digitizer event counter moved backwards or reset, or made "
+                  "an ambiguous half-range jump during acquisition");
+            }
+            if (counter_difference > 1U) {
+              const uint64_t newly_lost_events = counter_difference - 1U;
+              if (newly_lost_events >
+                  std::numeric_limits<uint64_t>::max() - lost_events_) {
+                throw FatalAcquisitionError(
+                    "Lost-event counter overflowed uint64_t");
+              }
+              prospective_lost_events += newly_lost_events;
+            }
+          }
+
+          const auto loss_policy_evaluation = cpnr::EvaluateLostEventPolicy(
+              recorded_events_ + 1U, prospective_lost_events,
+              hardware_settings_.lost_event_policy);
+          loss_policy_evaluation_observed_ = true;
+          loss_policy_observed_events_ =
+              loss_policy_evaluation.observed_events;
+          loss_policy_observed_lost_events_ =
+              loss_policy_evaluation.inferred_lost_events;
+          loss_policy_observed_lost_fraction_ =
+              loss_policy_evaluation.lost_fraction;
+          loss_policy_exceeded_ = loss_policy_evaluation.Exceeded();
+          loss_policy_rejected_post_gap_event_ = false;
+          // A counter gap is known as soon as the post-gap event is observed.
+          // Preserve that fact even if policy rejection or a later raw write
+          // failure prevents this event from entering the durable prefix.
+          lost_events_ = prospective_lost_events;
+          if (loss_policy_exceeded_) {
+            loss_policy_rejected_post_gap_event_ = true;
+            throw FatalAcquisitionError(
+                "Accepted-trigger loss exceeded [DataQuality] limits: "
+                "lost=" + std::to_string(prospective_lost_events) +
+                ", fraction=" +
+                std::to_string(loss_policy_evaluation.lost_fraction) +
+                ", max_lost=" +
+                std::to_string(
+                    hardware_settings_.lost_event_policy.max_lost_events) +
+                ", max_fraction=" +
+                std::to_string(hardware_settings_.lost_event_policy
+                                   .max_lost_fraction));
+          }
+
+          header = {};
+          header.ExtendedTTT = candidate_extended_ttt;
+          header.EventID = static_cast<uint32_t>(recorded_events_);
+          header.RecordLength = actual_trace_size;
+          header.ChannelMask = evt_info.ChannelMask;
+          header.Pattern = evt_info.Pattern;
+          header.BoardEventCounter = current_event_counter;
+          std::memcpy(raw_buffer_pool_.data(), &header, sizeof(header));
 
           size_t payload_size = sizeof(EventHeader);
           for (int ch = 0; ch < MAX_CH; ++ch) {
-            if ((header->ChannelMask >> ch) & 1) {
+            if ((header.ChannelMask >> ch) & 1U) {
               uint16_t *wave_src = caen_event->DataChannel[ch];
               uint32_t trace_size = caen_event->ChSize[ch];
-              if (trace_size == 0) continue;
-              if (payload_size + trace_size * sizeof(uint16_t) > raw_buffer_pool_.size()) break; 
+              if (payload_size + trace_size * sizeof(uint16_t) >
+                  raw_buffer_pool_.size()) {
+                throw FatalAcquisitionError(
+                    "Decoded event exceeds the reserved raw-output buffer");
+              }
 
-              std::memcpy(wave_dest + (payload_size - sizeof(EventHeader)) / sizeof(uint16_t), wave_src, trace_size * sizeof(uint16_t));
+              std::memcpy(raw_buffer_pool_.data() + payload_size, wave_src,
+                          trace_size * sizeof(uint16_t));
               payload_size += trace_size * sizeof(uint16_t);
             }
           }
 
-          if (out_stream_.is_open()) { out_stream_.write(raw_buffer_pool_.data(), payload_size); total_bytes_written += payload_size; }
-          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size, ZMQ_DONTWAIT) < 0) { if (zmq_errno() == EAGAIN) zmq_drops++; }
+          if (!output_stream_) {
+            throw FatalAcquisitionError("Raw output stream is not open");
+          }
+          const std::size_t bytes_written =
+              ::fwrite(raw_buffer_pool_.data(), 1, payload_size,
+                       output_stream_);
+          if (bytes_written != payload_size || ::ferror(output_stream_)) {
+            throw FatalAcquisitionError(
+                "Raw output write failed; acquisition stopped to prevent "
+                "silent data loss");
+          }
+          raw_output_digest_.Update(raw_buffer_pool_.data(), payload_size);
+          complete_raw_bytes_ += static_cast<uint64_t>(payload_size);
+          ++recorded_events_;
+          if (is_first_event) {
+            first_extended_ttt_ = header.ExtendedTTT;
+            trigger_time_tag_observed_ = true;
+            is_first_event = false;
+          }
+          last_extended_ttt_ = header.ExtendedTTT;
+          current_ttt = candidate_ttt;
+          prev_ttt = candidate_ttt;
+          prev_event_counter = current_event_counter;
+          last_event_earliest_time = current_batch_earliest_time;
+          ttt_rollovers = candidate_rollovers;
+          total_bytes_written += payload_size;
+          if (zmq_send(zmq_pub_, raw_buffer_pool_.data(), payload_size,
+                       ZMQ_DONTWAIT) < 0) {
+            const int publish_error = zmq_errno();
+            if (publish_error != EAGAIN) {
+              ++zmq_send_error_count_;
+              if (zmq_send_error_count_ == 1U ||
+                  (zmq_send_error_count_ &
+                   (zmq_send_error_count_ - 1U)) == 0U) {
+                std::cerr
+                    << "\n\033[1;33m[Warning] ZeroMQ monitoring publish "
+                       "failed; raw acquisition continues independently "
+                    << "(count=" << zmq_send_error_count_ << ", error="
+                    << zmq_strerror(publish_error) << ")\033[0m\n";
+              }
+            }
+            ++zmq_send_failures;
+            ++zmq_send_failure_count_;
+          }
           log_events++;
         }
       }
+    } catch (const FatalAcquisitionError&) {
+      CAEN_DGTZ_SWStopAcquisition(handle);
+      throw;
     } catch (const std::exception& e) {
-        std::cerr << "\n\033[1;33m[Warning] Readout Soft-Error: \033[0m" << e.what() << "\n";
+      CAEN_DGTZ_SWStopAcquisition(handle);
+      throw FatalAcquisitionError(
+          "CAEN event-block decoding failed after data was read; the "
+          "remaining block was not silently skipped: " +
+          std::string(e.what()));
     }
 
-    if (bsize > 0 || ++loop_counter % 10000 == 0) {
+    if (bsize > 0 ||
+        std::chrono::steady_clock::now() - last_health_check >=
+            std::chrono::milliseconds(250) ||
+        ++loop_counter % 10000 == 0) {
         auto now = std::chrono::steady_clock::now();
-        double current_elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-        if (run_time_sec_ > 0 && current_elapsed_sec >= run_time_sec_) break;
+        if (run_time_sec_ > 0) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    now - start_time).count() >= run_time_sec_) {
+              termination_reason_ = "time_limit";
+              break;
+            }
+        }
+
+        if (now - last_health_check >= std::chrono::milliseconds(250)) {
+            CheckRuntimeHealthAndStorage(handle, false, true);
+            last_health_check = now;
+        }
+
+        if (now - last_configuration_check >= std::chrono::seconds(1)) {
+            VerifyRuntimeConfiguration(handle);
+            last_configuration_check = now;
+        }
 
         double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
         if (elapsed_ms >= 1000.0) {
-            int mins = static_cast<int>(current_elapsed_sec) / 60;
-            int secs = static_cast<int>(current_elapsed_sec) % 60;
+            auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            int mins = total_sec / 60;
+            int secs = total_sec % 60;
 
             double rate = (log_events / elapsed_ms) * 1000.0;
             double speed_mbps = ((total_bytes_written - last_bytes_written) / 1048576.0) / (elapsed_ms / 1000.0);
             last_bytes_written = total_bytes_written;
 
-            uint32_t temp_reg = 0, status_reg = 0;
-            if (CAEN_DGTZ_ReadRegister(handle, 0x10A8, &temp_reg) == CAEN_DGTZ_Success) {
-                float temp_celsius = static_cast<float>(temp_reg & 0xFF);
-                
-                std::cout << "\n[STATUS] TEMP: " << std::fixed << std::setprecision(1) << temp_celsius << std::endl;
-                
-                if (temp_celsius >= 82.0) {
-                    std::cout << "\n[FATAL] OVER_TEMP_SOFT_KILL" << std::endl;
-                    is_running = false;
-                    break;
-                }
-            }
-            
-            if (CAEN_DGTZ_ReadRegister(handle, 0x8104, &status_reg) == CAEN_DGTZ_Success) {
-                int run      = (status_reg >> 0) & 0x1; 
-                int drdy     = (status_reg >> 2) & 0x1; 
-                int busy     = (status_reg >> 3) & 0x1; 
-                int pll_lock = ((status_reg >> 5) & 0x1) == 0 ? 1 : 0; 
+            if (health_readback_available_) {
+                const auto status = dt5730_status::DecodeAcquisitionStatus(
+                    latest_status_register_);
+                const auto board_failure =
+                    dt5730_status::DecodeBoardFailureStatus(
+                        latest_board_failure_register_);
+                const int pll_lock =
+                    status.pll_no_unlock && status.board_ready &&
+                            !board_failure.pll_failure
+                        ? 1
+                        : 0;
                 int trg      = (rate > 0.0) ? 1 : 0; 
-                int pll_byps = 0; 
 
-                std::cout << "[STATUS] LED: LOCK=" << pll_lock << ", BYPS=" << pll_byps
-                          << ", RUN=" << run << ", TRG=" << trg << ", DRDY=" << drdy
-                          << ", BUSY=" << busy << std::endl;
+                std::cout << "[STATUS] TEMP: "
+                          << std::fixed << std::setprecision(1)
+                          << latest_max_temperature_c_ << std::endl;
+                std::cout << "[STATUS] LED: LOCK=" << pll_lock
+                          << ", CLKEXT="
+                          << (status.clock_source ==
+                                      dt5730_status::ClockSource::kExternal
+                                  ? 1
+                                  : 0)
+                          << ", READY=" << (status.board_ready ? 1 : 0)
+                          << ", RUN=" << (status.run ? 1 : 0)
+                          << ", TRG=" << trg
+                          << ", DRDY=" << (status.event_ready ? 1 : 0)
+                          << ", FULL=" << (status.event_full ? 1 : 0)
+                          << std::endl;
             }
 
-            uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
-            
-            double display_real_time = current_elapsed_sec; 
-            double dead_time_sec = event_count * (record_length * 2e-9); 
-            double live_time_sec = display_real_time - dead_time_sec;
-            if (live_time_sec < 0) live_time_sec = 0.0;
-            
-            double dead_time_pct = (display_real_time > 0) ? (dead_time_sec / display_real_time * 100.0) : 0.0;
+            uint32_t record_length = hardware_settings_.record_length;
+            const uint64_t current_extended_ttt =
+                (ttt_rollovers <<
+                 dt5730_timing::kTriggerTimeTagBits) |
+                current_ttt;
+            const double hw_real_time_sec =
+                is_first_event
+                    ? 0.0
+                    : dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                                    current_extended_ttt);
+            const double recorded_window_sum_sec =
+                dt5730_timing::RecordedWindowSumSeconds(recorded_events_,
+                                                        record_length);
+            const double recorded_window_pct =
+                dt5730_timing::RecordedWindowToElapsedPercent(
+                    recorded_window_sum_sec, hw_real_time_sec);
 
-            std::cout << "\033[K\033[1;36m[LIVE DAQ]\033[0m "
+            std::cout << "\r\033[K\033[1;36m[LIVE DAQ]\033[0m "
                       << "Time: \033[1m" << std::setfill('0') << std::setw(2) << mins << ":" << std::setw(2) << secs << "\033[0m | "
-                      << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << display_real_time << " s\033[0m | "
-                      << "Live: \033[1m" << std::fixed << std::setprecision(2) << live_time_sec << " s\033[0m | " 
-                      << "DT: \033[1;31m" << std::fixed << std::setprecision(4) << dead_time_pct << " %\033[0m | "
+                      << "RealTime: \033[1m" << std::fixed << std::setprecision(2) << hw_real_time_sec << " s\033[0m | "
+                      << "Window: \033[1m" << std::fixed << std::setprecision(4) << recorded_window_pct << " %\033[0m | "
                       << "Rate: \033[1;35m" << std::fixed << std::setprecision(1) << rate << " Hz\033[0m | " 
-                      << "Events: \033[1;33m" << event_count << "\033[0m | "
+                      << "Events: \033[1;33m" << recorded_events_ << "\033[0m | "
                       << "Speed: \033[1;32m" << std::fixed << std::setprecision(2) << speed_mbps << " MB/s\033[0m | "
-                      << "Drops: " << zmq_drops << std::endl;
+                      << "PubSendFail: " << zmq_send_failures
+                      << std::flush;
               
-            log_events = 0; zmq_drops = 0; last_log_time = now;
+            log_events = 0; zmq_send_failures = 0; last_log_time = now;
         }
     }
   }
 
-  CAEN_DGTZ_SWStopAcquisition(handle);
+  if (termination_reason_ == "running") {
+    termination_reason_ =
+        (!is_running.load(std::memory_order_relaxed) ||
+         !running_.load(std::memory_order_relaxed))
+            ? "operator_stop"
+            : "completed";
+  }
+
+  if (software_random_trigger) {
+    software_random_trigger_elapsed_sec_ = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time).count();
+  }
+
+  CAEN_CHECK(CAEN_DGTZ_SWStopAcquisition(handle));
   std::cout << "\n\033[1;31m[DAQManager] Stopped Acquisition.\033[0m\n";
 
   auto t = std::time(nullptr);
   auto tm = *std::localtime(&t);
   
-  uint32_t record_length = config_.GetInt("Digitizer", "RecordLength", 4096);
-  uint64_t final_total_ticks = (ttt_rollovers << 31) + current_ttt - first_ttt;
+  uint32_t record_length = hardware_settings_.record_length;
+  const double final_real_time_sec =
+      trigger_time_tag_observed_
+          ? dt5730_timing::ElapsedSeconds(first_extended_ttt_,
+                                          last_extended_ttt_)
+          : 0.0;
+  const double final_recorded_window_sum_sec =
+      dt5730_timing::RecordedWindowSumSeconds(recorded_events_,
+                                              record_length);
+  const double final_recorded_window_pct =
+      dt5730_timing::RecordedWindowToElapsedPercent(
+          final_recorded_window_sum_sec, final_real_time_sec);
   auto wall_clock_duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
   
-  double final_real_time_sec = (event_count > 1) ? final_total_ticks * 8e-9 : static_cast<double>(wall_clock_duration);
-  double final_dead_time_sec = event_count * (record_length * 2e-9);
-  double final_live_time_sec = final_real_time_sec - final_dead_time_sec;
-  if (final_live_time_sec < 0) final_live_time_sec = 0.0;
-  
-  double final_dead_time_pct = (final_real_time_sec > 0) ? (final_dead_time_sec / final_real_time_sec * 100.0) : 0.0;
-  double avg_rate = (final_real_time_sec > 0) ? (event_count / final_real_time_sec) : 0.0;
+  const double avg_rate = dt5730_timing::AverageRecordedEventRateHz(
+      recorded_events_, final_real_time_sec);
+  const double software_random_effective_rate =
+      software_random_trigger_elapsed_sec_ > 0.0
+          ? static_cast<double>(software_random_triggers_sent_) /
+                software_random_trigger_elapsed_sec_
+          : 0.0;
 
   std::cout << "\n\033[1;36m========== [ DAQ Run Summary ] ==========\033[0m\n"
             << " - End Time        : " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n"
             << " - Wall Clock Time : " << wall_clock_duration << " seconds\n"
             << " - HW Real Time    : " << std::fixed << std::setprecision(2) << final_real_time_sec << " seconds\n"
-            << " - HW Live Time    : " << std::fixed << std::setprecision(2) << final_live_time_sec << " seconds\n"
-            << " - True Dead Time  : " << std::fixed << std::setprecision(5) << final_dead_time_pct << " %\n"
-            << " - Total Events    : " << event_count << " events\n"
+            << " - Record Windows : " << std::fixed << std::setprecision(6) << final_recorded_window_sum_sec << " seconds (sum; overlaps possible)\n"
+            << " - Window / Time  : " << std::fixed << std::setprecision(5) << final_recorded_window_pct << " % (not dead time)\n"
+            << " - HW Dead Time   : N/A (no hardware busy/live-time scaler)\n"
+            << " - Total Events    : " << recorded_events_ << " events\n"
             << " - Avg Trig Rate   : " << std::fixed << std::setprecision(2) << avg_rate << " Hz\n" 
-            << " - Lost Events     : " << lost_events << " events (Buffer Full)\n"
+            << (software_random_trigger ? " - SW Random Req    : " : "")
+            << (software_random_trigger
+                    ? std::to_string(
+                          hardware_settings_.software_random_trigger_rate_hz) +
+                          " Hz\n"
+                    : "")
+            << (software_random_trigger ? " - SW Random Sent   : " : "")
+            << (software_random_trigger
+                    ? std::to_string(software_random_triggers_sent_) +
+                          " (effective " +
+                          std::to_string(software_random_effective_rate) +
+                          " Hz)\n"
+                    : "")
+            << " - Lost Events     : " << lost_events_ << " events (24-bit board-counter gaps)\n"
             << " - Data Size Saved : " << std::fixed << std::setprecision(2) << (total_bytes_written / (1024.0 * 1024.0)) << " MB\n"
             << "\033[1;36m=========================================\033[0m\n\n";
 }

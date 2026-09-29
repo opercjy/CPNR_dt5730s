@@ -1,40 +1,120 @@
-from PyQt6.QtWidgets import QMainWindow, QTabWidget, QStatusBar, QLabel, QWidget, QHBoxLayout
-from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QScrollArea,
+    QSizePolicy,
+    QStatusBar,
+    QTabWidget,
+    QWidget,
+)
+from PyQt6.QtCore import QProcess, QTimer, Qt, pyqtSlot
 from widgets.DaqTab import DaqTab
 from widgets.ConfigTab import ConfigTab
 from widgets.MonitorTab import MonitorTab
 from widgets.ProductionTab import ProductionTab
+from widgets.RootValidationTab import RootValidationTab
 from widgets.DatabaseTab import DatabaseTab
 from widgets.EnvTab import EnvTab
+from core.monitor_stream import RuntimeConfigReference
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._close_pending = False
+        self._shutdown_ready = False
+        self._close_check_scheduled = False
+        self._monitor_cleaned = False
+        self._last_monitor_runtime_config = None
         self.setWindowTitle("HEP 3-Tier DAQ Control Center (DT5730S 14-bit) - PyQt6")
-        self.resize(1200, 900)
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1000, 700)
+        else:
+            available = screen.availableGeometry()
+            self.resize(
+                max(1, min(1200, int(available.width() * 0.9))),
+                max(1, min(900, int(available.height() * 0.9))),
+            )
 
         self.tabs = QTabWidget()
+        self.tabs.setMinimumSize(0, 0)
         self.setCentralWidget(self.tabs)
 
         self.env_tab = EnvTab()
         self.daq_tab = DaqTab(env_data_provider=self.env_tab.get_env_data)
         self.config_tab = ConfigTab()
-        self.monitor_tab = MonitorTab()
+        self.monitor_tab = MonitorTab(
+            config_path_provider=self._monitor_runtime_config_path
+        )
         self.production_tab = ProductionTab()
+        self.root_validation_tab = RootValidationTab()
         self.database_tab = DatabaseTab()
 
-        self.tabs.addTab(self.daq_tab, "🚀 DAQ Control")
-        self.tabs.addTab(self.env_tab, "🌡️ Environment & Meta")
-        self.tabs.addTab(self.config_tab, "⚙️ Hardware Config")
-        self.tabs.addTab(self.monitor_tab, "📈 Live Monitor")
-        self.tabs.addTab(self.production_tab, "🔬 Offline Production")
-        self.tabs.addTab(self.database_tab, "🗄️ Run DB History")
+        self._tab_scroll_areas = []
+        for widget, title in (
+            (self.daq_tab, "🚀 DAQ Control"),
+            (self.env_tab, "🌡️ Environment & Meta"),
+            (self.config_tab, "⚙️ Hardware Config"),
+            (self.monitor_tab, "📈 Live Monitor"),
+            (self.production_tab, "🔬 Offline Production"),
+            (self.root_validation_tab, "✅ ROOT Validation"),
+            (self.database_tab, "🗄️ Run DB History"),
+        ):
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+            scroll_area.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            scroll_area.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            scroll_area.setMinimumSize(0, 0)
+            scroll_area.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            scroll_area.setWidget(widget)
+            self._tab_scroll_areas.append(scroll_area)
+            self.tabs.addTab(scroll_area, title)
 
         self.init_statusbar()
         
         self.daq_tab.hardware_led_signal.connect(self.update_led_dashboard)
         self.daq_tab.hardware_temp_signal.connect(self.monitor_tab.update_temperature)
         self.daq_tab.daq_finished_signal.connect(self.reset_led_dashboard)
+        self.daq_tab.daq_finished_signal.connect(
+            self._hold_monitor_preview_after_daq
+        )
+        self.daq_tab.runContextReady.connect(self.production_tab.set_run_context)
+        self.production_tab.rootOutputReady.connect(
+            self.root_validation_tab.set_root_file
+        )
+        self.daq_tab.daq_finished_signal.connect(self._maybe_finish_close)
+        self.daq_tab.recovery_finished_signal.connect(self._maybe_finish_close)
+        self.production_tab.process.finished.connect(self._maybe_finish_close)
+        self.production_tab.process.errorOccurred.connect(
+            self._maybe_finish_close
+        )
+        self.root_validation_tab.process.finished.connect(
+            self._maybe_finish_close
+        )
+        self.root_validation_tab.process.errorOccurred.connect(
+            self._maybe_finish_close
+        )
+        self.config_tab.configPathChanged.connect(self.daq_tab.set_config_path)
+        self.config_tab.configDirtyChanged.connect(
+            self.daq_tab.set_config_dirty
+        )
+        if self.config_tab.current_config_path:
+            self.daq_tab.set_config_path(self.config_tab.current_config_path)
+        self.daq_tab.set_config_dirty(
+            self.config_tab.current_config_path,
+            self.config_tab.is_dirty(),
+        )
 
         # =========================================================================
         # [신규 추가] DAQ Control 탭과 Hardware Config 탭의 스캔 범위 시각화 파이프라인
@@ -46,12 +126,71 @@ class MainWindow(QMainWindow):
         self.daq_tab.emit_scan_range()
         # =========================================================================
 
+    def _monitor_runtime_config_path(self):
+        """Keep the monitor bound to the last snapshot it actually observed."""
+
+        process_active = self._daq_process_active()
+        context = getattr(self.daq_tab, "current_run_context", None) or {}
+        config_path = context.get("config_path")
+        config_sha256 = context.get("config_sha256")
+        if process_active:
+            # Do not silently fall back to a mutable UI selection during an
+            # active acquisition. The monitor will pause spectrum DSP if the
+            # immutable run snapshot cannot be identified.
+            if not config_path or not config_sha256:
+                return None
+            reference = RuntimeConfigReference(config_path, config_sha256)
+            self._last_monitor_runtime_config = reference
+            return reference
+
+        # Returning to the mutable Config tab file after a run made
+        # MonitorTab interpret DAQ completion as a new runtime and erase its
+        # final waveform/spectrum. Keep the exact last-observed snapshot until
+        # a genuinely new active run supplies a different identity. If the
+        # monitor never polled during the first run, its completed context is
+        # still the safest initial reference.
+        if self._last_monitor_runtime_config is not None:
+            return self._last_monitor_runtime_config
+        if config_path and config_sha256:
+            reference = RuntimeConfigReference(config_path, config_sha256)
+            self._last_monitor_runtime_config = reference
+            return reference
+        return self.config_tab.current_config_path or None
+
+    def _daq_process_active(self):
+        process = getattr(self.daq_tab, "daq_process", None)
+        return bool(
+            process
+            and (
+                process.isRunning()
+                or (
+                    hasattr(process, "has_pending_work")
+                    and process.has_pending_work()
+                )
+            )
+        )
+
+    @pyqtSlot(int)
+    def _hold_monitor_preview_after_daq(self, returncode):
+        # on_batch_finished starts the next scan/batch before forwarding this
+        # signal. Do not label an already-running next segment as held.
+        process = getattr(self.daq_tab, "daq_process", None)
+        if process is not None:
+            if hasattr(process, "has_pending_work"):
+                if process.has_pending_work():
+                    return
+            elif process.isRunning():
+                return
+        self.monitor_tab.hold_last_preview(returncode)
+
     def init_statusbar(self):
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
 
         self.led_widgets = {}
-        led_names = ['PLL LOCK', 'PLL BYPS', 'RUN', 'TRG', 'DRDY', 'BUSY']
+        led_names = [
+            'PLL LOCK', 'CLK EXT', 'BOARD READY', 'RUN', 'TRG', 'DRDY', 'FULL'
+        ]
         
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -72,11 +211,12 @@ class MainWindow(QMainWindow):
     def update_led_dashboard(self, status: dict):
         color_map = {
             'PLL LOCK': "#198754" if status.get('PLL LOCK', 0) else "#555555",
-            'PLL BYPS': "#ffc107" if status.get('PLL BYPS', 0) else "#555555", 
+            'CLK EXT':  "#ffc107" if status.get('CLK EXT', 0) else "#555555",
+            'BOARD READY': "#198754" if status.get('BOARD READY', 0) else "#dc3545",
             'RUN':      "#198754" if status.get('RUN', 0)      else "#555555",
             'TRG':      "#198754" if status.get('TRG', 0)      else "#555555",
             'DRDY':     "#0dcaf0" if status.get('DRDY', 0)     else "#555555",
-            'BUSY':     "#dc3545" if status.get('BUSY', 0)     else "#555555"
+            'FULL':     "#dc3545" if status.get('FULL', 0)     else "#555555"
         }
 
         for key, color in color_map.items():
@@ -90,8 +230,53 @@ class MainWindow(QMainWindow):
         for key in self.led_widgets:
             self.led_widgets[key].setStyleSheet("color: #555555; font-size: 18px; margin-right: 15px;")
 
+    def _workers_active(self):
+        daq_active = self._daq_process_active()
+        production_active = self.production_tab.has_pending_work()
+        validation_active = self.root_validation_tab.has_pending_work()
+        return (daq_active or self.daq_tab.recovery_active() or
+                production_active or validation_active)
+
+    def _cleanup_monitor_once(self):
+        if not self._monitor_cleaned:
+            self._monitor_cleaned = True
+            self.monitor_tab.cleanup()
+
+    def _schedule_close_check(self):
+        if self._close_check_scheduled:
+            return
+        self._close_check_scheduled = True
+        QTimer.singleShot(50, self._maybe_finish_close)
+
+    @pyqtSlot()
+    def _maybe_finish_close(self, *_args):
+        self._close_check_scheduled = False
+        if not self._close_pending:
+            return
+        if self._workers_active():
+            self._schedule_close_check()
+            return
+        self._shutdown_ready = True
+        self.close()
+
     def closeEvent(self, event):
-        self.daq_tab.stop_all()
-        self.monitor_tab.cleanup()
-        self.production_tab.stop_all()
-        event.accept()
+        if self._shutdown_ready or not self._workers_active():
+            self._cleanup_monitor_once()
+            event.accept()
+            return
+
+        event.ignore()
+        if self._close_pending:
+            self._schedule_close_check()
+            return
+
+        self._close_pending = True
+        self.tabs.setEnabled(False)
+        self.statusBar.showMessage(
+            "Stopping active jobs; unresponsive children will be force-stopped "
+            "after their bounded provenance-finalization grace period…"
+        )
+        self.daq_tab.stop_all(auto_force=True)
+        self.production_tab.stop_all(auto_force=True)
+        self.root_validation_tab.stop_all(wait=False)
+        self._schedule_close_check()

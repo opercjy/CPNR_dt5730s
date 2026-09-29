@@ -1,0 +1,437 @@
+import json
+import sys
+import unittest
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GUI_DIR = PROJECT_ROOT / "gui"
+if str(GUI_DIR) not in sys.path:
+    sys.path.insert(0, str(GUI_DIR))
+
+from core.root_validation_output import (  # noqa: E402
+    parse_validation_json_line,
+    parse_validation_output,
+    parse_validation_progress,
+    status_counts,
+    validated_charge_histograms,
+    validate_report_envelope,
+)
+
+
+def sample_report():
+    return {
+        "schema_version": 1,
+        "overall_status": "PASS",
+        "file": "/data/run021_prod.root",
+        "summary": {"entries": 200000},
+        "analysis": {"completed": True, "cancelled": False},
+        "domain_status": {
+            "data_integrity": "PASS",
+            "provenance": "SKIP",
+            "trigger_and_quality": "SKIP",
+        },
+        "checks": [
+            {
+                "id": "tree.entries",
+                "status": "PASS",
+                "category": "integrity",
+                "name": "tree_entries",
+                "message": "Tree and metadata event counts agree",
+            }
+        ],
+        "channels": [
+            {"channel": 0, "status": "PASS"},
+            {"channel": 1, "status": "PASS"},
+        ],
+        "counts": {"pass": 1, "warn": 0, "fail": 0, "skip": 0},
+    }
+
+
+INPUT_IDENTITY = {
+    "device": 2049,
+    "inode": 123456,
+    "mode": 0o100440,
+    "size_bytes": 987654,
+    "mtime_seconds": 1700000000,
+    "mtime_nanoseconds": 123456789,
+    "ctime_seconds": 1700000001,
+    "ctime_nanoseconds": 987654321,
+}
+
+
+def envelope_report(*, max_events=None, raw_fidelity=False):
+    report = sample_report()
+    report["input"] = {
+        "path": "/data/run021_prod.root",
+        "max_events": max_events,
+        "raw_fidelity_requested": raw_fidelity,
+        "identity_start": dict(INPUT_IDENTITY),
+        "identity_end": dict(INPUT_IDENTITY),
+    }
+    report["validator"] = {
+        "executable_path": "/opt/cpnr/root_validate_dt5730",
+        "executable_sha256": "a" * 64,
+    }
+    return report
+
+
+def charge_histogram(
+    *,
+    available=True,
+    edges=None,
+    counts=None,
+    values_sampled=3,
+    events_scanned=3,
+    sample_stride=1,
+    sampled=False,
+    coverage="full_scan",
+):
+    return {
+        "available": available,
+        "source_branch": "Charge_CH0",
+        "unit": "ADC.sample",
+        "binning": "linear",
+        "bin_edges": [0.0, 10.0, 20.0] if edges is None else edges,
+        "counts": [1, 2] if counts is None else counts,
+        "values_sampled": values_sampled,
+        "events_scanned": events_scanned,
+        "sample_stride": sample_stride,
+        "sampled": sampled,
+        "coverage": coverage,
+    }
+
+
+class RootValidationOutputTests(unittest.TestCase):
+    def test_charge_histogram_schema_is_validated_and_channel_sorted(self):
+        channel_two = charge_histogram(
+            edges=[10.0, 20.0],
+            counts=[2],
+            values_sampled=2,
+            events_scanned=4,
+            sample_stride=2,
+            sampled=True,
+            coverage="stride_sampled_full_scan",
+        )
+        channel_two["source_branch"] = "Charge_CH2"
+        unavailable = charge_histogram(
+            available=False,
+            edges=[],
+            counts=[],
+            values_sampled=2,
+            events_scanned=2,
+        )
+        unavailable["source_branch"] = "Charge_CH1"
+        channels = [
+            {"channel": 2, "charge_histogram": channel_two},
+            {"channel": 1, "charge_histogram": unavailable},
+            {"channel": 0, "charge_histogram": charge_histogram()},
+        ]
+
+        histograms = validated_charge_histograms(channels)
+
+        self.assertEqual(sorted(histograms), [0, 1, 2])
+        self.assertEqual(histograms[0]["bin_edges"], [0.0, 10.0, 20.0])
+        self.assertEqual(histograms[0]["counts"], [1, 2])
+        self.assertEqual(histograms[0]["values_sampled"], 3)
+        self.assertFalse(histograms[1]["available"])
+        self.assertEqual(histograms[1]["bin_edges"], [])
+        self.assertEqual(histograms[1]["counts"], [])
+        self.assertEqual(histograms[1]["values_sampled"], 2)
+        self.assertTrue(histograms[2]["sampled"])
+        self.assertEqual(histograms[2]["sample_stride"], 2)
+
+    def test_charge_histogram_schema_is_optional_for_legacy_reports(self):
+        self.assertEqual(
+            validated_charge_histograms(sample_report()["channels"]), {}
+        )
+
+    def test_charge_histogram_schema_rejects_corrupt_bin_invariants(self):
+        corrupt_payloads = {
+            "edge_count_mismatch": charge_histogram(
+                edges=[0.0, 10.0], counts=[1, 2]
+            ),
+            "nonfinite_edge": charge_histogram(
+                edges=[0.0, float("inf"), 20.0]
+            ),
+            "nonincreasing_edges": charge_histogram(
+                edges=[0.0, 10.0, 10.0]
+            ),
+            "negative_count": charge_histogram(counts=[1, -1]),
+            "boolean_count": charge_histogram(counts=[True, 2]),
+            "fractional_count": charge_histogram(counts=[1.5, 2]),
+            "count_sum_mismatch": charge_histogram(
+                counts=[1, 1], values_sampled=3
+            ),
+        }
+        for label, payload in corrupt_payloads.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    validated_charge_histograms(
+                        [{"channel": 0, "charge_histogram": payload}]
+                    )
+
+    def test_report_envelope_rejects_a_present_malformed_histogram(self):
+        report = envelope_report()
+        report["channels"][0]["charge_histogram"] = charge_histogram(
+            counts=[1, -1]
+        )
+
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                report,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
+
+    def test_progress_parser_accepts_ansi_spacing_and_fractional_values(self):
+        self.assertEqual(
+            parse_validation_progress(
+                "\x1b[36m[ValidationProgress] 37.5% | "
+                "Scanning event branches\x1b[0m"
+            ),
+            (37.5, "Scanning event branches"),
+        )
+        self.assertEqual(
+            parse_validation_progress(
+                "  [ValidationProgress]   8 % | Opening ROOT file  "
+            ),
+            (8.0, "Opening ROOT file"),
+        )
+
+    def test_progress_is_clamped_and_malformed_values_are_ignored(self):
+        self.assertEqual(
+            parse_validation_progress(
+                "[ValidationProgress] 101.25% | Finalizing"
+            ),
+            (100.0, "Finalizing"),
+        )
+        for line in (
+            "unrelated diagnostic",
+            "[ValidationProgress] nan% | Scan",
+            "[ValidationProgress] inf% | Scan",
+            "[ValidationProgress] 50%",
+            "[ValidationProgress] 50% |   ",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_validation_progress(line))
+
+    def test_json_line_parser_accepts_plain_and_documented_prefixes(self):
+        report = sample_report()
+        encoded = json.dumps(report)
+        for line in (
+            encoded,
+            f"REPORT_JSON: {encoded}",
+            f"[ValidationResult] {encoded}",
+            f"\x1b[32mREPORT_JSON:\x1b[0m {encoded}",
+        ):
+            with self.subTest(line=line[:40]):
+                self.assertEqual(parse_validation_json_line(line), report)
+
+    def test_json_line_parser_rejects_malformed_or_non_object_payloads(self):
+        for line in (
+            "",
+            "not json",
+            "REPORT_JSON: {broken",
+            "[]",
+            '"a string"',
+            "[ValidationResult] null",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_validation_json_line(line))
+
+    def test_full_output_parser_finds_report_among_diagnostics(self):
+        report = sample_report()
+        self.assertEqual(
+            parse_validation_output(json.dumps(report, indent=2)), report
+        )
+        output = (
+            "ROOT startup diagnostic\n"
+            "[ValidationProgress] 50% | Scan\n"
+            f"REPORT_JSON: {json.dumps(report)}\n"
+        )
+        self.assertEqual(parse_validation_output(output), report)
+
+    def test_status_counts_make_skipped_checks_visible(self):
+        report = sample_report()
+        report.pop("counts")
+        report["checks"].append({"status": "SKIP", "name": "partial"})
+        self.assertEqual(
+            status_counts(report),
+            {"pass": 1, "warn": 0, "fail": 0, "skip": 1},
+        )
+
+    def test_report_envelope_authenticates_input_and_validator(self):
+        report = envelope_report()
+        validate_report_envelope(
+            report,
+            input_path="/data/run021_prod.root",
+            max_events=0,
+            input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
+            validator_path="/opt/cpnr/root_validate_dt5730",
+            validator_sha256="a" * 64,
+        )
+        for field, replacement in (
+            ("executable_path", "/tmp/swapped-validator"),
+            ("executable_sha256", "b" * 64),
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(report))
+                changed["validator"][field] = replacement
+                with self.assertRaises(ValueError):
+                    validate_report_envelope(
+                        changed,
+                        input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+    def test_report_envelope_binds_exact_requested_max_events(self):
+        report = envelope_report(max_events=25000)
+        validate_report_envelope(
+            report,
+            input_path="/data/run021_prod.root",
+            max_events=25000,
+            input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
+            validator_path="/opt/cpnr/root_validate_dt5730",
+            validator_sha256="a" * 64,
+        )
+
+        for reported_value in (None, 24999, False, 25000.0):
+            with self.subTest(reported=reported_value):
+                changed = json.loads(json.dumps(report))
+                changed["input"]["max_events"] = reported_value
+                with self.assertRaises(ValueError):
+                    validate_report_envelope(
+                        changed,
+                        input_path="/data/run021_prod.root",
+                        max_events=25000,
+                        input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+        missing = json.loads(json.dumps(report))
+        del missing["input"]["max_events"]
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                missing,
+                input_path="/data/run021_prod.root",
+                max_events=25000,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
+
+    def test_report_envelope_binds_raw_fidelity_mode(self):
+        report = envelope_report(raw_fidelity=True)
+        validate_report_envelope(
+            report,
+            input_path="/data/run021_prod.root",
+            max_events=0,
+            input_identity_start=INPUT_IDENTITY,
+            input_identity_end=INPUT_IDENTITY,
+            validator_path="/opt/cpnr/root_validate_dt5730",
+            validator_sha256="a" * 64,
+            raw_fidelity_requested=True,
+        )
+        report["input"]["raw_fidelity_requested"] = False
+        with self.assertRaisesRegex(ValueError, "RAW fidelity mode"):
+            validate_report_envelope(
+                report,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+                raw_fidelity_requested=True,
+            )
+
+    def test_report_envelope_rejects_terminal_truth_inconsistency(self):
+        base = envelope_report()
+        cases = (
+            (
+                "final_identity",
+                lambda value: value["input"]["identity_end"].__setitem__(
+                    "inode", INPUT_IDENTITY["inode"] + 1
+                ),
+                "end stat",
+            ),
+            (
+                "counts",
+                lambda value: value["counts"].__setitem__("pass", 2),
+                "count is inconsistent",
+            ),
+            (
+                "overall",
+                lambda value: value.__setitem__("overall_status", "WARN"),
+                "overall_status is inconsistent",
+            ),
+            (
+                "lifecycle",
+                lambda value: value["analysis"].__setitem__(
+                    "completed", False
+                ),
+                "lifecycle flags are inconsistent",
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                report = json.loads(json.dumps(base))
+                mutate(report)
+                with self.assertRaisesRegex(ValueError, expected):
+                    validate_report_envelope(
+                        report,
+                        input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+    def test_report_envelope_binds_every_input_start_identity_field(self):
+        report = envelope_report()
+        for field in INPUT_IDENTITY:
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(report))
+                changed["input"]["identity_start"][field] += 1
+                with self.assertRaisesRegex(ValueError, field):
+                    validate_report_envelope(
+                        changed,
+                        input_path="/data/run021_prod.root",
+                        max_events=0,
+                        input_identity_start=INPUT_IDENTITY,
+                        input_identity_end=INPUT_IDENTITY,
+                        validator_path="/opt/cpnr/root_validate_dt5730",
+                        validator_sha256="a" * 64,
+                    )
+
+        missing = json.loads(json.dumps(report))
+        del missing["input"]["identity_start"]
+        with self.assertRaises(ValueError):
+            validate_report_envelope(
+                missing,
+                input_path="/data/run021_prod.root",
+                max_events=0,
+                input_identity_start=INPUT_IDENTITY,
+                input_identity_end=INPUT_IDENTITY,
+                validator_path="/opt/cpnr/root_validate_dt5730",
+                validator_sha256="a" * 64,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

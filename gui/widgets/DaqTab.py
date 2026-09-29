@@ -1,7 +1,11 @@
 import os
-import shutil
 import configparser
+import hashlib
+import json
 import re
+import math
+import stat
+import tempfile
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QPushButton, QLineEdit, QLabel, QTextEdit, 
                              QGroupBox, QSpinBox, QComboBox, QFileDialog, QMessageBox)
@@ -9,8 +13,273 @@ from PyQt6.QtGui import QFont, QTextCursor, QPainter, QColor, QPen, QBrush, QLin
 from PyQt6.QtCore import QTimer, QSettings, pyqtSignal, pyqtSlot, Qt
 
 from core.ProcessManager import ProcessManager
-from core.DatabaseManager import DatabaseManager
+from core.DatabaseManager import DatabaseManager, DatabaseError
+from core.process_output import parse_drop_count
+from core.trigger_settings import millivolts_to_adc_delta
+from core.dc_offset_settings import (
+    DC_OFFSET_MODE_TARGET,
+    parse_dc_offset_settings,
+)
+from core.dt5730_constraints import (
+    MAX_RECORD_LENGTH,
+    MAX_PROVENANCE_GATE_SAMPLES,
+    MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    MIN_PRE_TRIGGER_SAMPLES,
+    MIN_RECORD_LENGTH,
+    MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ,
+    predict_post_trigger,
+    validate_effective_record_length,
+)
+from core.runtime_paths import (
+    RuntimeValidationError,
+    build_frontend_command,
+    create_run_config_snapshot,
+    expected_raw_size_bytes,
+    file_identity,
+    find_project_root,
+    frontend_expected_absent_paths,
+    frontend_sources,
+    identity_summary,
+    inspect_output_filesystem,
+    raw_event_size_bytes,
+    resolve_path,
+    sidecar_paths,
+    validate_output_capacity,
+    verify_binary_fresh,
+    verify_deployed_gui,
+)
 
+DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic.conf"
+LEGACY_DEFAULT_CONFIG_PATH = "config/dt5730s_inorganic_master.conf"
+
+
+def format_iec_bytes(value):
+    """Compact, deterministic IEC byte rendering for operator displays."""
+
+    size = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(size) < 1024.0 or suffix == "PiB":
+            precision = 0 if suffix == "B" else 2
+            return f"{size:.{precision}f} {suffix}"
+        size /= 1024.0
+
+
+def validate_stop_condition(stop_index, max_events, run_time_sec):
+    """Reject a selected finite stop mode whose limit would mean unlimited."""
+
+    if stop_index == 1 and max_events <= 0:
+        raise ValueError(
+            "Stop Cond가 Max Events이면 Evts를 1 이상으로 설정해야 합니다. "
+            "0은 무기한 실행으로 변환하지 않습니다."
+        )
+    if stop_index == 2 and run_time_sec <= 0:
+        raise ValueError(
+            "Stop Cond가 Max Time이면 Sec를 1 이상으로 설정해야 합니다. "
+            "0은 무기한 실행으로 변환하지 않습니다."
+        )
+    if stop_index not in (0, 1, 2):
+        raise ValueError(f"알 수 없는 Stop Cond 선택값입니다: {stop_index}")
+
+
+MAX_TERMINAL_METADATA_BYTES = 4 * 1024 * 1024
+TERMINAL_ACQUISITION_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _absolute_path(value):
+    return os.path.abspath(os.path.expanduser(os.fspath(value)))
+
+
+def _require_matching_path(document, field, expected):
+    observed = document.get(field)
+    if not isinstance(observed, str) or not observed:
+        raise ValueError(f"runtime metadata {field} is missing")
+    if _absolute_path(observed) != _absolute_path(expected):
+        raise ValueError(f"runtime metadata {field} does not match the launch")
+
+
+def _require_matching_sha256(document, field, expected):
+    observed = document.get(field)
+    if (
+        not isinstance(observed, str)
+        or len(observed) != 64
+        or any(character not in "0123456789abcdef" for character in observed)
+    ):
+        raise ValueError(f"runtime metadata {field} is not lowercase SHA-256")
+    if observed != expected:
+        raise ValueError(f"runtime metadata {field} does not match the launch")
+
+
+def _read_stable_terminal_metadata(metadata_path):
+    path = _absolute_path(metadata_path)
+    with open(path, "rb") as metadata_file:
+        before = os.fstat(metadata_file.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("runtime metadata is not a regular file")
+        if before.st_size > MAX_TERMINAL_METADATA_BYTES:
+            raise ValueError("runtime metadata exceeds the 4 MiB safety limit")
+        payload = metadata_file.read(MAX_TERMINAL_METADATA_BYTES + 1)
+        after = os.fstat(metadata_file.fileno())
+    before_identity = (
+        before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev, after.st_ino, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns,
+    )
+    if before_identity != after_identity or len(payload) != before.st_size:
+        raise ValueError("runtime metadata changed while it was read")
+    try:
+        document = json.loads(payload.decode("utf-8", errors="strict"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("runtime metadata is not valid UTF-8") from exc
+    if not isinstance(document, dict):
+        raise ValueError("runtime metadata must be a JSON object")
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    identity = file_identity(path)
+    if identity["sha256"] != payload_sha256:
+        raise ValueError("runtime metadata path changed after it was read")
+    return document, identity
+
+
+def load_terminal_run_metadata(metadata_path, context):
+    """Return identity-bound canonical terminal truth for one launched run."""
+
+    if not isinstance(context, dict):
+        raise ValueError("launched run context is unavailable")
+    required_context = (
+        "raw_file", "metadata_path", "run_number", "config_path",
+        "config_sha256", "frontend_path", "frontend_sha256",
+    )
+    missing = [key for key in required_context if not context.get(key)]
+    if missing:
+        raise ValueError(
+            "launched run context is missing identity fields: "
+            + ", ".join(missing)
+        )
+    if _absolute_path(metadata_path) != _absolute_path(context["metadata_path"]):
+        raise ValueError("terminal metadata path differs from the launched run")
+
+    document, identity = _read_stable_terminal_metadata(metadata_path)
+    if document.get("schema_version") != 2:
+        raise ValueError("runtime metadata schema_version must be 2")
+    if document.get("run_number") != int(context["run_number"]):
+        raise ValueError("runtime metadata run_number does not match the launch")
+    status = document.get("acquisition_status")
+    if status not in TERMINAL_ACQUISITION_STATUSES:
+        raise ValueError(
+            "runtime metadata acquisition_status is not terminal"
+        )
+
+    _require_matching_path(
+        document, "requested_raw_output_path", context["raw_file"]
+    )
+    _require_matching_path(document, "metadata_path", context["metadata_path"])
+    _require_matching_path(document, "config_path", context["config_path"])
+    _require_matching_path(document, "binary_path", context["frontend_path"])
+    _require_matching_sha256(
+        document, "config_sha256", context["config_sha256"]
+    )
+    _require_matching_sha256(
+        document, "binary_sha256", context["frontend_sha256"]
+    )
+
+    published = document.get("raw_output_published")
+    finalized = document.get("raw_output_finalized")
+    if not isinstance(published, bool) or not isinstance(finalized, bool):
+        raise ValueError("runtime metadata raw publication flags are invalid")
+    if published:
+        _require_matching_path(document, "raw_output_path", context["raw_file"])
+        if not os.path.isfile(context["raw_file"]):
+            raise ValueError("published raw output is missing")
+
+    failure_reason = document.get("failure_reason")
+    termination_reason = document.get("termination_reason")
+    if not isinstance(termination_reason, str) or not termination_reason:
+        raise ValueError("runtime metadata termination_reason is missing")
+    if status == "completed":
+        if termination_reason not in {
+            "event_limit", "time_limit", "operator_stop", "completed"
+        }:
+            raise ValueError("completed metadata has an invalid termination_reason")
+        if failure_reason is not None:
+            raise ValueError("completed metadata contains a failure_reason")
+        if not published or not finalized:
+            raise ValueError("completed metadata does not confirm raw finalization")
+        if document.get("raw_finalization_error") is not None:
+            raise ValueError("completed metadata contains raw_finalization_error")
+    elif status == "failed":
+        if not isinstance(failure_reason, str) or not failure_reason:
+            raise ValueError("failed metadata requires failure_reason")
+    else:
+        if not termination_reason.startswith("cancelled_"):
+            raise ValueError("cancelled metadata has an invalid termination_reason")
+        if failure_reason is not None:
+            raise ValueError("cancelled metadata contains failure_reason")
+
+    if finalized:
+        output_size = document.get("raw_output_size_bytes")
+        event_bytes = document.get("raw_event_bytes")
+        recorded_events = document.get("recorded_events")
+        last_complete_offset = document.get("last_complete_offset")
+        for name, value in (
+            ("raw_output_size_bytes", output_size),
+            ("raw_event_bytes", event_bytes),
+            ("recorded_events", recorded_events),
+            ("last_complete_offset", last_complete_offset),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"runtime metadata {name} is invalid")
+        if event_bytes <= 0:
+            raise ValueError("runtime metadata raw_event_bytes must be positive")
+        if recorded_events * event_bytes != output_size:
+            raise ValueError("runtime metadata raw event accounting is inconsistent")
+        if last_complete_offset != output_size:
+            raise ValueError("runtime metadata complete offset is inconsistent")
+        digest = document.get("raw_output_sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("runtime metadata raw_output_sha256 is invalid")
+        if published and os.path.getsize(context["raw_file"]) != output_size:
+            raise ValueError("published raw size differs from terminal metadata")
+
+    return document, identity
+
+
+def load_completed_run_metadata(metadata_path, raw_path, run_number):
+    """Legacy structural check; DAQ lifecycle uses identity-bound validation."""
+
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        document = json.load(metadata_file)
+    if not isinstance(document, dict):
+        raise ValueError("runtime metadata must be a JSON object")
+    if document.get("acquisition_status") != "completed":
+        raise ValueError(
+            "runtime metadata acquisition_status is not 'completed'"
+        )
+    if document.get("run_number") != int(run_number):
+        raise ValueError(
+            "runtime metadata run_number does not match the launched run"
+        )
+    requested_output = document.get("requested_raw_output_path")
+    if not requested_output or os.path.abspath(requested_output) != os.path.abspath(raw_path):
+        raise ValueError(
+            "runtime metadata requested_raw_output_path does not match the run"
+        )
+    if document.get("raw_output_published") is not True:
+        raise ValueError("runtime metadata does not confirm raw publication")
+    if document.get("raw_output_finalized") is not True:
+        raise ValueError("runtime metadata does not confirm raw finalization")
+    if not os.path.isfile(raw_path):
+        raise ValueError("completed runtime metadata exists but raw output is missing")
+    return document
+
+# =========================================================================
+# [물리적 방향성(Negative Pulse)이 적용된 1D 스캔 비주얼라이저]
+# =========================================================================
 class ADCScanVisualizer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -95,19 +364,25 @@ class DaqTab(QWidget):
     hardware_led_signal = pyqtSignal(dict)
     hardware_temp_signal = pyqtSignal(float)
     daq_finished_signal = pyqtSignal(int)
+    recovery_finished_signal = pyqtSignal()
     
     scanRangeChanged = pyqtSignal(int, int)
     scanModeToggled = pyqtSignal(bool)
+    runContextReady = pyqtSignal(dict)
 
     def __init__(self, parent=None, env_data_provider=None):
         super().__init__(parent)
         self.env_data_provider = env_data_provider
         self.daq_process = None
+        self.recovery_process = None
+        self._recovery_config = None
+        self._recovery_timed_out = False
+        self.recovery_timer = QTimer(self)
+        self.recovery_timer.setSingleShot(True)
+        self.recovery_timer.timeout.connect(self._timeout_recovery)
         
-        curr = os.path.abspath(os.path.dirname(__file__))
-        while curr != '/' and not os.path.exists(os.path.join(curr, 'CMakeLists.txt')):
-            curr = os.path.dirname(curr)
-        self.proj_dir = curr if curr != '/' else os.getcwd()
+        self.proj_dir = str(find_project_root(__file__))
+        self.runtime_gui_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         self.bin_dir = os.path.join(self.proj_dir, "bin")
         self.data_dir = os.path.join(self.proj_dir, "data")
@@ -120,10 +395,23 @@ class DaqTab(QWidget):
         self.current_batch = 0; self.total_batches = 1
         self.base_output_path = ""; self.scan_values = [] 
         self.last_stats = {}; self.current_run_id = -1
+        self.current_run_uuid = ""
         self.current_run_no = 1
+        self.validated_config_full = ""
+        self.validated_config_text = ""
+        self.validated_config_identity = {}
+        self.validated_frontend_identity = {}
+        self.config_uses_mv_threshold = False
+        self.validated_storage_settings = None
+        self.last_storage_plan = None
+        self.current_run_context = None
+        self.stop_requested = False
+        self.config_dirty = False
+        self.dirty_config_path = ""
         
         self.setup_ui()
         self.load_settings()
+        self.refresh_runtime_identities()
 
         self.disk_timer = QTimer(self)
         self.disk_timer.timeout.connect(self.update_disk_space)
@@ -136,7 +424,9 @@ class DaqTab(QWidget):
         file_group = QGroupBox("File & Configuration Environment")
         file_layout = QGridLayout()
         file_layout.addWidget(QLabel("Config (.conf):"), 0, 0)
-        self.config_input = QLineEdit("config/dt5730s_inorganic_master.conf")
+        self.config_input = QLineEdit(DEFAULT_CONFIG_PATH)
+        self.config_input.textChanged.connect(self.refresh_runtime_identities)
+        self.config_input.textChanged.connect(self.update_disk_space)
         file_layout.addWidget(self.config_input, 0, 1)
         self.btn_browse_config = QPushButton("Browse")
         self.btn_browse_config.clicked.connect(self.browse_config)
@@ -146,6 +436,7 @@ class DaqTab(QWidget):
         
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit("data/data_run.dat")
+        self.output_input.textChanged.connect(self.update_disk_space)
         out_layout.addWidget(self.output_input)
         self.spin_run_no = QSpinBox()
         self.spin_run_no.setPrefix("Run No: ")
@@ -172,6 +463,38 @@ class DaqTab(QWidget):
         env_layout.addWidget(self.temp_input)
         
         file_layout.addLayout(env_layout, 2, 1, 1, 2)
+
+        file_layout.addWidget(QLabel("Resolved frontend:"), 3, 0)
+        self.lbl_frontend_identity = QLabel()
+        self.lbl_frontend_identity.setWordWrap(True)
+        self.lbl_frontend_identity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        file_layout.addWidget(self.lbl_frontend_identity, 3, 1, 1, 2)
+
+        file_layout.addWidget(QLabel("Resolved config:"), 4, 0)
+        self.lbl_config_identity = QLabel()
+        self.lbl_config_identity.setWordWrap(True)
+        self.lbl_config_identity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        file_layout.addWidget(self.lbl_config_identity, 4, 1, 1, 2)
+
+        file_layout.addWidget(QLabel("Loaded GUI:"), 5, 0)
+        self.lbl_gui_identity = QLabel(os.path.abspath(__file__))
+        self.lbl_gui_identity.setWordWrap(True)
+        self.lbl_gui_identity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        file_layout.addWidget(self.lbl_gui_identity, 5, 1, 1, 2)
+
+        file_layout.addWidget(QLabel("Output storage:"), 6, 0)
+        self.lbl_output_storage = QLabel("Checking selected output path...")
+        self.lbl_output_storage.setWordWrap(True)
+        self.lbl_output_storage.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        file_layout.addWidget(self.lbl_output_storage, 6, 1, 1, 2)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
@@ -183,9 +506,11 @@ class DaqTab(QWidget):
         self.combo_stop_cond = QComboBox()
         self.combo_stop_cond.addItems(["Unlimited", "Max Events", "Max Time"])
         self.combo_stop_cond.currentIndexChanged.connect(self.toggle_stop_cond)
+        self.combo_stop_cond.currentIndexChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.combo_stop_cond)
         
         self.spin_events = QSpinBox(); self.spin_events.setRange(0, 2000000000); self.spin_events.setPrefix("Evts: ")
+        self.spin_events.valueChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.spin_events)
         
         self.spin_time = QSpinBox(); self.spin_time.setRange(0, 86400); self.spin_time.setPrefix("Sec: ")
@@ -195,10 +520,12 @@ class DaqTab(QWidget):
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Single Continuous", "Split/Batch Mode", "Auto Threshold Scan"])
         self.combo_mode.currentIndexChanged.connect(self.toggle_batch_mode)
+        self.combo_mode.currentIndexChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.combo_mode)
         
         self.lbl_batch = QLabel("Batches:")
         self.spin_batch = QSpinBox(); self.spin_batch.setRange(2, 999); self.spin_batch.setEnabled(False)
+        self.spin_batch.valueChanged.connect(self.update_disk_space)
         cond_layout1.addWidget(self.lbl_batch)
         cond_layout1.addWidget(self.spin_batch)
         cond_main_layout.addLayout(cond_layout1)
@@ -217,6 +544,9 @@ class DaqTab(QWidget):
         
         self.spin_scan_start.valueChanged.connect(self.emit_scan_range)
         self.spin_scan_end.valueChanged.connect(self.emit_scan_range)
+        self.spin_scan_start.valueChanged.connect(self.update_disk_space)
+        self.spin_scan_end.valueChanged.connect(self.update_disk_space)
+        self.spin_scan_step.valueChanged.connect(self.update_disk_space)
         
         cond_main_layout.addLayout(self.scan_layout)
 
@@ -237,16 +567,20 @@ class DaqTab(QWidget):
         dash_layout.addWidget(QLabel("Storage:", styleSheet=lbl_style), 0, 0); self.val_disk = QLabel("Checking...", styleSheet=self.val_style); dash_layout.addWidget(self.val_disk, 0, 1)
         dash_layout.addWidget(QLabel("Batch/Scan:", styleSheet=lbl_style), 0, 2); self.val_batch = QLabel("1/1", styleSheet=self.val_style); dash_layout.addWidget(self.val_batch, 0, 3)
         
-        dash_layout.addWidget(QLabel("Live Time:", styleSheet=lbl_style), 0, 4); self.val_live_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_live_time, 0, 5)
+        dash_layout.addWidget(QLabel("HW Real Time:", styleSheet=lbl_style), 0, 4); self.val_real_time = QLabel("0.0 s", styleSheet=self.val_style); dash_layout.addWidget(self.val_real_time, 0, 5)
         dash_layout.addWidget(QLabel("Events:", styleSheet=lbl_style), 0, 6); self.val_events = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_events, 0, 7)
         
         dash_layout.addWidget(QLabel("Data Speed:", styleSheet=lbl_style), 1, 0); self.val_speed = QLabel("0.00 MB/s", styleSheet=self.val_style); dash_layout.addWidget(self.val_speed, 1, 1)
-        dash_layout.addWidget(QLabel("ZMQ Drops:", styleSheet=lbl_style), 1, 2); self.val_drops = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_drops, 1, 3)
-        dash_layout.addWidget(QLabel("Dead Time:", styleSheet=lbl_style), 1, 4); self.val_dead_time = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_dead_time, 1, 5)
+        dash_layout.addWidget(QLabel("Pub Send Fail:", styleSheet=lbl_style), 1, 2); self.val_pub_send_failures = QLabel("0", styleSheet=self.val_style); dash_layout.addWidget(self.val_pub_send_failures, 1, 3)
+        dash_layout.addWidget(QLabel("Record Window:", styleSheet=lbl_style), 1, 4); self.val_record_window = QLabel("0.000 %", styleSheet=self.val_style); dash_layout.addWidget(self.val_record_window, 1, 5)
         
+        # =========================================================================
+        # [신규 추가] 레이아웃 우측 하단에 Trig Rate 블록 추가
+        # =========================================================================
         dash_layout.addWidget(QLabel("Trig Rate:", styleSheet=lbl_style), 1, 6)
         self.val_rate = QLabel("0.0 Hz", styleSheet=self.val_style)
         dash_layout.addWidget(self.val_rate, 1, 7)
+        # =========================================================================
         
         dash_group.setLayout(dash_layout)
         layout.addWidget(dash_group)
@@ -260,6 +594,13 @@ class DaqTab(QWidget):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_all)
         btn_layout.addWidget(self.btn_start); btn_layout.addWidget(self.btn_stop)
+        self.btn_recover = QPushButton("디지타이저 상태 정상화")
+        self.btn_recover.setToolTip(
+            "수집을 정지하고 보드를 리셋한 뒤 장비 버퍼를 비웁니다. "
+            "저장된 데이터 파일은 유지됩니다. 다음 DAQ 시작 시 설정을 다시 적용합니다."
+        )
+        self.btn_recover.clicked.connect(self.recover_digitizer)
+        btn_layout.addWidget(self.btn_recover)
         layout.addLayout(btn_layout)
 
         self.terminal = QTextEdit(); self.terminal.setReadOnly(True); self.terminal.setFont(QFont("Monospace", 10))
@@ -278,7 +619,11 @@ class DaqTab(QWidget):
         self.spin_time.setEnabled(idx == 2)
 
     def load_settings(self):
-        saved_config = self.settings.value("last_config", "config/dt5730s_inorganic_master.conf")
+        saved_config = self.settings.value("last_config", DEFAULT_CONFIG_PATH)
+        legacy_full_path = os.path.abspath(os.path.join(self.proj_dir, LEGACY_DEFAULT_CONFIG_PATH))
+        if saved_config == LEGACY_DEFAULT_CONFIG_PATH and not os.path.isfile(legacy_full_path):
+            saved_config = DEFAULT_CONFIG_PATH
+            self.settings.setValue("last_config", saved_config)
         self.config_input.setText(saved_config)
         self.output_input.setText(self.settings.value("last_output", "data/data_run.dat"))
         self.spin_run_no.setValue(int(self.settings.value("last_run_no", 1)))
@@ -296,14 +641,58 @@ class DaqTab(QWidget):
         self.settings.setValue("last_time", self.spin_time.value())
         self.settings.setValue("last_stop_cond", self.combo_stop_cond.currentIndex())
 
+    def refresh_runtime_identities(self, *_):
+        if not hasattr(self, "lbl_frontend_identity"):
+            return
+        executable = os.path.join(self.bin_dir, "frontend_dt5730")
+        try:
+            identity = file_identity(executable)
+            self.lbl_frontend_identity.setText(identity_summary(identity))
+            self.lbl_frontend_identity.setStyleSheet("color: #495057;")
+        except (OSError, RuntimeValidationError) as exc:
+            self.lbl_frontend_identity.setText(f"UNAVAILABLE: {executable} ({exc})")
+            self.lbl_frontend_identity.setStyleSheet("color: #dc3545; font-weight: bold;")
+
+        config_value = self.config_input.text().strip()
+        if not config_value:
+            self.lbl_config_identity.setText("UNAVAILABLE: config path is empty")
+            self.lbl_config_identity.setStyleSheet("color: #dc3545; font-weight: bold;")
+            return
+        try:
+            config_path = resolve_path(self.proj_dir, config_value)
+            identity = file_identity(config_path)
+            self.lbl_config_identity.setText(identity_summary(identity))
+            self.lbl_config_identity.setStyleSheet("color: #495057;")
+        except (OSError, RuntimeValidationError) as exc:
+            self.lbl_config_identity.setText(f"UNAVAILABLE: {config_value} ({exc})")
+            self.lbl_config_identity.setStyleSheet("color: #dc3545; font-weight: bold;")
+
+    def validate_runtime_artifacts(self, config_path):
+        verify_deployed_gui(self.runtime_gui_dir, self.proj_dir)
+        executable = os.path.join(self.bin_dir, "frontend_dt5730")
+        frontend_identity = verify_binary_fresh(
+            executable, frontend_sources(self.proj_dir)
+        )
+        config_identity = file_identity(config_path)
+        self.validated_frontend_identity = frontend_identity
+        self.validated_config_identity = config_identity
+        self.lbl_frontend_identity.setText(identity_summary(frontend_identity))
+        self.lbl_config_identity.setText(identity_summary(config_identity))
+        return str(executable), frontend_identity, config_identity
+
     def parse_env_from_config(self, filepath):
         if not os.path.isabs(filepath): full_path = os.path.abspath(os.path.join(self.proj_dir, filepath))
         else: full_path = filepath
         if not os.path.exists(full_path): return
 
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
         cfg.optionxform = str
-        cfg.read(full_path)
+        try:
+            with open(full_path, 'r', encoding='utf-8') as config_file:
+                cfg.read_file(config_file)
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            self.append_log(f"[Config Warning] 환경 메타데이터를 읽지 못했습니다: {exc}")
+            return
         if cfg.has_section("Environment"):
             self.operator_input.setText(cfg.get("Environment", "Operator", fallback="Unknown"))
             self.hv_input.setText(cfg.get("Environment", "AppliedHV", fallback="0V"))
@@ -324,10 +713,38 @@ class DaqTab(QWidget):
 
     def browse_config(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Config File", self.config_dir, "Config Files (*.conf *.ini);;All Files (*)")
-        if path: 
-            self.config_input.setText(os.path.relpath(path, self.proj_dir))
-            self.parse_env_from_config(path)
-            self.save_settings()
+        if path:
+            self.set_config_path(path)
+
+    @pyqtSlot(str)
+    def set_config_path(self, path):
+        resolved = resolve_path(self.proj_dir, path)
+        if not resolved.is_file():
+            self.append_log(
+                f"[Config Warning] 동기화할 설정 파일이 없습니다: {resolved}"
+            )
+            return
+        self.config_input.setText(str(resolved))
+        self.parse_env_from_config(str(resolved))
+        self.save_settings()
+        self.refresh_runtime_identities()
+
+    @pyqtSlot(str, bool)
+    def set_config_dirty(self, path, dirty):
+        self.dirty_config_path = (
+            str(resolve_path(self.proj_dir, path)) if path else ""
+        )
+        self.config_dirty = bool(dirty)
+
+    def ensure_selected_config_is_saved(self, config_path):
+        if not self.config_dirty or not self.dirty_config_path:
+            return
+        selected = str(resolve_path(self.proj_dir, config_path))
+        if selected == self.dirty_config_path:
+            raise ValueError(
+                "Hardware Config 탭에 저장되지 않은 변경사항이 있습니다. "
+                "Save .conf를 누른 뒤 DAQ를 시작하세요."
+            )
 
     def browse_output(self):
         path, _ = QFileDialog.getSaveFileName(self, "Select Base Output File", self.data_dir, "Data Files (*.dat);;All Files (*)")
@@ -335,12 +752,191 @@ class DaqTab(QWidget):
             self.output_input.setText(os.path.relpath(path, self.proj_dir))
             self.save_settings()
 
-    def update_disk_space(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-        total, used, free = shutil.disk_usage(self.data_dir)
-        free_gb = free / (2**30)
-        self.val_disk.setStyleSheet(self.val_style_warn if free_gb < 10.0 else self.val_style)
-        self.val_disk.setText(f"{free_gb:.1f} GB")
+    def _storage_settings_from_selected_config(self):
+        config_value = self.config_input.text().strip()
+        if not config_value:
+            raise RuntimeValidationError("설정 파일 경로가 비어 있습니다.")
+        config_path = resolve_path(self.proj_dir, config_value)
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                parser.read_file(config_file)
+            record_length = parser.getint("Digitizer", "RecordLength")
+            channel_mask = parser.getint("Digitizer", "ChannelMask")
+            minimum_free_mib = (
+                parser.getint("Storage", "MinimumFreeMiB")
+                if parser.has_option("Storage", "MinimumFreeMiB") else 1024
+            )
+            stop_free_mib = (
+                parser.getint("Storage", "StopFreeMiB")
+                if parser.has_option("Storage", "StopFreeMiB") else 512
+            )
+        except (OSError, UnicodeError, configparser.Error, ValueError) as exc:
+            raise RuntimeValidationError(
+                f"저장공간 계산용 설정을 읽을 수 없습니다: {config_path} ({exc})"
+            ) from exc
+
+        # This also enforces the exact raw-format limits used by the frontend.
+        raw_event_size_bytes(record_length, channel_mask)
+        if not 64 <= minimum_free_mib <= 1048576:
+            raise RuntimeValidationError(
+                "[Storage] MinimumFreeMiB는 64..1048576이어야 합니다."
+            )
+        if not 32 <= stop_free_mib <= 1048575:
+            raise RuntimeValidationError(
+                "[Storage] StopFreeMiB는 32..1048575여야 합니다."
+            )
+        if stop_free_mib >= minimum_free_mib:
+            raise RuntimeValidationError(
+                "[Storage] StopFreeMiB는 MinimumFreeMiB보다 작아야 합니다."
+            )
+        return {
+            "record_length": record_length,
+            "channel_mask": channel_mask,
+            "minimum_free_bytes": minimum_free_mib * 1024 * 1024,
+            "stop_free_bytes": stop_free_mib * 1024 * 1024,
+        }
+
+    def _planned_segment_count(self):
+        mode = self.combo_mode.currentIndex()
+        if mode == 1:
+            return self.spin_batch.value()
+        if mode == 2:
+            start = self.spin_scan_start.value()
+            end = self.spin_scan_end.value()
+            step = self.spin_scan_step.value()
+            return len(
+                range(start, end + 1, step)
+                if start <= end else range(start, end - 1, -step)
+            )
+        return 1
+
+    def _build_storage_plan(self, *, output_path=None, settings=None,
+                            segments=None, enforce=False):
+        settings = settings or self._storage_settings_from_selected_config()
+        segments = self._planned_segment_count() if segments is None else segments
+        stop_index = self.combo_stop_cond.currentIndex()
+        max_events = self.spin_events.value() if stop_index == 1 else 0
+        output_value = (
+            self.output_input.text().strip()
+            if output_path is None else str(output_path)
+        )
+        filesystem = inspect_output_filesystem(
+            self.proj_dir, output_value
+        )
+        event_bytes = raw_event_size_bytes(
+            settings["record_length"], settings["channel_mask"]
+        )
+        expected_segment = expected_raw_size_bytes(
+            settings["record_length"], settings["channel_mask"], max_events
+        )
+        expected_total = expected_raw_size_bytes(
+            settings["record_length"], settings["channel_mask"], max_events,
+            segments=segments,
+        )
+        required_bytes = settings["minimum_free_bytes"] + (
+            expected_total or 0
+        )
+        if enforce:
+            validate_output_capacity(
+                filesystem["free_bytes"], expected_total,
+                settings["minimum_free_bytes"],
+            )
+        return {
+            **filesystem,
+            **settings,
+            "event_bytes": event_bytes,
+            "max_events": max_events,
+            "segments": segments,
+            "expected_segment_bytes": expected_segment,
+            "expected_total_bytes": expected_total,
+            "required_bytes": required_bytes,
+            "capacity_ok": filesystem["free_bytes"] >= required_bytes,
+        }
+
+    def _show_storage_plan(self, plan):
+        expected = plan["expected_total_bytes"]
+        if expected is None:
+            estimate_text = "RAW 크기 미확정(시간/수동 종료)"
+            requirement_text = (
+                f"start reserve {format_iec_bytes(plan['minimum_free_bytes'])}"
+            )
+        else:
+            estimate_text = (
+                f"planned RAW {format_iec_bytes(expected)} "
+                f"({format_iec_bytes(plan['expected_segment_bytes'])}"
+                f" × {plan['segments']})"
+            )
+            requirement_text = (
+                f"required {format_iec_bytes(plan['required_bytes'])}"
+            )
+        ancestor_note = ""
+        if plan["inspected_path"] != plan["output_parent"]:
+            ancestor_note = f"; nearest existing={plan['inspected_path']}"
+        details = (
+            f"target={plan['output_parent']} | filesystem={plan['mount_point']} "
+            f"(dev {plan['device']}{ancestor_note}) | "
+            f"free {format_iec_bytes(plan['free_bytes'])} / "
+            f"{format_iec_bytes(plan['total_bytes'])} | "
+            f"event {format_iec_bytes(plan['event_bytes'])} | "
+            f"{estimate_text} | {requirement_text} | runtime stop watermark "
+            f"{format_iec_bytes(plan['stop_free_bytes'])}"
+        )
+        style = (
+            "color: #495057;" if plan["capacity_ok"] else
+            "color: #dc3545; font-weight: bold;"
+        )
+        self.lbl_output_storage.setStyleSheet(style)
+        self.lbl_output_storage.setText(details)
+        self.val_disk.setStyleSheet(
+            self.val_style if plan["capacity_ok"] else self.val_style_warn
+        )
+        if expected is None:
+            self.val_disk.setText(
+                f"{format_iec_bytes(plan['free_bytes'])} free / "
+                f"{format_iec_bytes(plan['minimum_free_bytes'])} reserve"
+            )
+        else:
+            self.val_disk.setText(
+                f"{format_iec_bytes(plan['free_bytes'])} free / "
+                f"{format_iec_bytes(plan['required_bytes'])} required"
+            )
+        self.val_disk.setToolTip(details)
+        self.last_storage_plan = plan
+
+    @staticmethod
+    def _storage_log_summary(plan):
+        expected = plan["expected_total_bytes"]
+        expected_text = (
+            "unknown" if expected is None else format_iec_bytes(expected)
+        )
+        return (
+            f"filesystem={plan['mount_point']} dev={plan['device']}, "
+            f"free={format_iec_bytes(plan['free_bytes'])}, "
+            f"event={format_iec_bytes(plan['event_bytes'])}, "
+            f"planned_raw={expected_text}, segments={plan['segments']}, "
+            f"start_reserve={format_iec_bytes(plan['minimum_free_bytes'])}, "
+            f"stop_watermark={format_iec_bytes(plan['stop_free_bytes'])}"
+        )
+
+    def update_disk_space(self, *_):
+        if not hasattr(self, "val_disk") or not hasattr(
+            self, "lbl_output_storage"
+        ):
+            return
+        try:
+            plan = self._build_storage_plan()
+            self._show_storage_plan(plan)
+        except (OSError, ValueError, RuntimeValidationError) as exc:
+            self.last_storage_plan = None
+            self.val_disk.setStyleSheet(self.val_style_warn)
+            self.val_disk.setText("Storage unavailable")
+            self.val_disk.setToolTip(str(exc))
+            self.lbl_output_storage.setStyleSheet(
+                "color: #dc3545; font-weight: bold;"
+            )
+            self.lbl_output_storage.setText(f"UNAVAILABLE: {exc}")
 
     def append_log(self, text):
         safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -357,32 +953,39 @@ class DaqTab(QWidget):
 
     def update_dashboard(self, stats):
         self.last_stats = stats
-        self.val_live_time.setText(stats.get('live_time', stats.get('Live', '0.0 s')))
+        self.val_real_time.setText(stats.get('real_time', '0.0 s'))
         self.val_events.setText(stats.get('events', stats.get('Events', '0')))
         self.val_speed.setText(stats.get('speed', stats.get('Speed', '0.00 MB/s'))) 
         
+        # =========================================================================
+        # [신규 추가] Rate 업데이트 파싱 강화
+        # 파이썬 파서가 넘겨줄 때 'Rate' 혹은 'rate' 키워드를 모두 추적하여 UI에 반영
+        # =========================================================================
         rate_val = stats.get('rate', stats.get('Rate', '0.0 Hz'))
         if "Hz" not in rate_val and rate_val != "0.0": 
             rate_val += " Hz"
         self.val_rate.setText(rate_val)
+        # =========================================================================
         
-        dt_str = stats.get('dead_time', stats.get('DT', '0.000 %'))
-        self.val_dead_time.setText(dt_str)
+        window_str = stats.get('window_load', '0.000 %')
+        self.val_record_window.setText(window_str)
         try:
-            dt_val = float(dt_str.replace('%', '').strip())
-            self.val_dead_time.setStyleSheet(self.val_style_warn if dt_val > 5.0 else self.val_style)
+            window_value = float(window_str.replace('%', '').strip())
+            # Above 100% means event record windows overlap in time.  This is
+            # not hardware dead time, but is useful as a high-rate warning.
+            self.val_record_window.setStyleSheet(
+                self.val_style_warn if window_value > 100.0 else self.val_style
+            )
         except ValueError:
             pass
 
-        # =========================================================================
-        # [방어 코드 2중화] 파서에서 누출된 쓰레기 문자가 있어도 안전하게 정수로 파싱
-        # =========================================================================
-        raw_drops = str(stats.get('drops', stats.get('Drops', '0')))
-        match = re.search(r'\d+', raw_drops)
-        drops = int(match.group()) if match else 0
-        
-        self.val_drops.setStyleSheet(self.val_style_warn if drops > 0 else self.val_style)
-        self.val_drops.setText(str(drops))
+        send_failures = parse_drop_count(
+            stats.get('publisher_send_failures', '0')
+        )
+        self.val_pub_send_failures.setStyleSheet(
+            self.val_style_warn if send_failures > 0 else self.val_style
+        )
+        self.val_pub_send_failures.setText(str(send_failures))
 
     @pyqtSlot(str)
     def handle_fatal_error(self, err_type):
@@ -394,8 +997,576 @@ class DaqTab(QWidget):
             )
             self.stop_all()
 
+    def validate_config_before_start(self):
+        self.validated_storage_settings = None
+        config_path = self.config_input.text().strip()
+        if not config_path:
+            raise ValueError("설정 파일 경로가 비어 있습니다.")
+
+        config_full = config_path if os.path.isabs(config_path) else os.path.join(self.proj_dir, config_path)
+        config_full = os.path.abspath(config_full)
+        if not os.path.isfile(config_full):
+            raise ValueError(f"설정 파일을 찾을 수 없습니다: {config_full}")
+
+        try:
+            with open(config_full, 'r', encoding='utf-8') as config_file:
+                config_lines = config_file.readlines()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"설정 파일을 읽을 수 없습니다: {exc}") from exc
+
+        config_data = {}
+        current_section = None
+        for line_number, raw_line in enumerate(config_lines, start=1):
+            line = raw_line.replace('\u00a0', ' ').strip()
+            if not line or line[0] in '#;':
+                continue
+
+            if line.startswith('['):
+                if not line.endswith(']'):
+                    raise ValueError(f"잘못된 섹션 문법입니다 (line {line_number}).")
+                current_section = line[1:-1].strip()
+                if not current_section:
+                    raise ValueError(f"빈 섹션 이름입니다 (line {line_number}).")
+                if current_section in config_data:
+                    raise ValueError(f"중복 섹션입니다: [{current_section}] (line {line_number})")
+                config_data[current_section] = {}
+                continue
+
+            if '=' not in line or current_section is None:
+                raise ValueError(f"잘못된 설정 문법입니다 (line {line_number}).")
+            key, raw_value = (part.strip() for part in line.split('=', 1))
+            if not key or not raw_value:
+                raise ValueError(f"빈 설정 키 또는 값입니다 (line {line_number}).")
+            if key in config_data[current_section]:
+                raise ValueError(
+                    f"중복 설정 키입니다: [{current_section}] {key} (line {line_number})"
+                )
+            config_data[current_section][key] = raw_value
+
+        if not any(config_data.values()):
+            raise ValueError("설정 파일에 적용할 값이 없습니다.")
+
+        def required_int(section, key, min_value, max_value):
+            if section not in config_data or key not in config_data[section]:
+                raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
+            raw_value = config_data[section][key]
+            if not re.fullmatch(r'[+-]?[0-9]+', raw_value):
+                raise ValueError(f"정수가 아닌 설정값입니다: [{section}] {key}={raw_value}")
+            value = int(raw_value, 10)
+            if not min_value <= value <= max_value:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"(허용 {min_value}..{max_value})"
+                )
+            return value
+
+        def optional_int(section, key, default_value, min_value, max_value):
+            if section not in config_data or key not in config_data[section]:
+                return default_value
+            raw_value = config_data[section][key]
+            if not re.fullmatch(r'[+-]?[0-9]+', raw_value):
+                raise ValueError(
+                    f"정수가 아닌 설정값입니다: [{section}] {key}={raw_value}"
+                )
+            value = int(raw_value, 10)
+            if not min_value <= value <= max_value:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"(허용 {min_value}..{max_value})"
+                )
+            return value
+
+        def required_choice(section, key, choices):
+            if section not in config_data or key not in config_data[section]:
+                raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
+            value = config_data[section][key]
+            if value not in choices:
+                allowed = ", ".join(sorted(choices))
+                raise ValueError(
+                    f"설정값 오류: [{section}] {key}={value} (허용 {allowed})"
+                )
+            return value
+
+        def required_float(section, key, min_exclusive=None, max_exclusive=None):
+            if section not in config_data or key not in config_data[section]:
+                raise ValueError(f"필수 설정이 없습니다: [{section}] {key}")
+            raw_value = config_data[section][key]
+            try:
+                value = float(raw_value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"실수가 아닌 설정값입니다: [{section}] {key}={raw_value}"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(f"유한하지 않은 설정값입니다: [{section}] {key}")
+            if min_exclusive is not None and value <= min_exclusive:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"({min_exclusive}보다 커야 함)"
+                )
+            if max_exclusive is not None and value >= max_exclusive:
+                raise ValueError(
+                    f"설정값 범위 오류: [{section}] {key}={value} "
+                    f"({max_exclusive}보다 작아야 함)"
+                )
+            return value
+
+        record_length = required_int(
+            "Digitizer", "RecordLength",
+            MIN_RECORD_LENGTH, MAX_RECORD_LENGTH,
+        )
+        channel_mask = required_int("Digitizer", "ChannelMask", 1, (1 << 8) - 1)
+        post_trigger = required_int("Digitizer", "PostTrigger", 0, 100)
+        required_int("Digitizer", "TriggerPolarity", 0, 1)
+        ext_trigger = required_int("Digitizer", "ExtTriggerMode", 0, 1)
+        self_trigger = required_int("Digitizer", "SelfTriggerMode", 0, 1)
+        random_trigger_mode = optional_int(
+            "Digitizer", "SoftwareRandomTriggerMode", 0, 0, 1
+        )
+        random_rate_raw = config_data.get("Digitizer", {}).get(
+            "SoftwareRandomTriggerRateHz", "0"
+        )
+        try:
+            random_trigger_rate = float(random_rate_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "실수가 아닌 설정값입니다: [Digitizer] "
+                f"SoftwareRandomTriggerRateHz={random_rate_raw}"
+            ) from exc
+        if not math.isfinite(random_trigger_rate):
+            raise ValueError(
+                "[Digitizer] SoftwareRandomTriggerRateHz는 유한한 값이어야 합니다."
+            )
+        if random_trigger_mode:
+            if not (
+                MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+                <= random_trigger_rate
+                <= MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ
+            ):
+                raise ValueError(
+                    "Software Random 모드의 SoftwareRandomTriggerRateHz는 "
+                    f"{MIN_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g}.."
+                    f"{MAX_SOFTWARE_RANDOM_TRIGGER_RATE_HZ:g} Hz 범위여야 합니다."
+                )
+        elif random_trigger_rate != 0:
+            raise ValueError(
+                "SoftwareRandomTriggerMode=0이면 "
+                "SoftwareRandomTriggerRateHz는 0이어야 합니다."
+            )
+
+        input_range_mv = required_int("Digitizer", "InputRangeMv", 500, 2000)
+        if input_range_mv not in (500, 2000):
+            raise ValueError("[Digitizer] InputRangeMv는 500 또는 2000이어야 합니다.")
+        adc_bits = required_int("Digitizer", "ADCBits", 14, 14)
+        minimum_free_mib = optional_int(
+            "Storage", "MinimumFreeMiB", 1024, 64, 1048576
+        )
+        stop_free_mib = optional_int(
+            "Storage", "StopFreeMiB", 512, 32, 1048575
+        )
+        if stop_free_mib >= minimum_free_mib:
+            raise ValueError(
+                "[Storage] StopFreeMiB는 MinimumFreeMiB보다 작아야 합니다."
+            )
+        if "Synchronization" in config_data:
+            required_int("Synchronization", "ClockSource", 0, 1)
+            required_int("Synchronization", "RunSyncMode", 0, 4)
+
+        trigger_keys = (
+            ("Digitizer", "SelfTriggerMask"),
+            ("HardwareCoincidence", "PairLogic"),
+        )
+        trigger_key_count = sum(
+            section in config_data and key in config_data[section]
+            for section, key in trigger_keys
+        )
+        if trigger_key_count not in (0, len(trigger_keys)):
+            raise ValueError(
+                "[Digitizer] SelfTriggerMask와 [HardwareCoincidence] "
+                "PairLogic은 두 항목을 모두 설정하거나 모두 생략해야 합니다."
+            )
+
+        if trigger_key_count == 0:
+            self_trigger_mask = channel_mask if self_trigger else 0
+            pair_logic = "OR"
+        else:
+            self_trigger_mask = required_int(
+                "Digitizer", "SelfTriggerMask", 0, (1 << 8) - 1
+            )
+            pair_logic = required_choice(
+                "HardwareCoincidence", "PairLogic", {"AND", "OR"}
+            )
+
+        try:
+            validate_effective_record_length(record_length)
+            post_trigger_truth = predict_post_trigger(
+                record_length, post_trigger
+            )
+        except ValueError as exc:
+            raise ValueError(f"[Digitizer] {exc}") from exc
+        if post_trigger_truth.actual_pre_samples < MIN_PRE_TRIGGER_SAMPLES:
+            raise ValueError("[Digitizer] 트리거 이전 구간이 최소 160 ns보다 짧습니다.")
+        if post_trigger_truth.actual_post_samples < 1:
+            raise ValueError(
+                "[Digitizer] PostTrigger가 SoftwareDSP용 트리거 이후 "
+                "샘플을 남기지 않습니다."
+            )
+        if random_trigger_mode:
+            if ext_trigger or self_trigger:
+                raise ValueError(
+                    "Software Random은 External/Self trigger와 함께 사용할 수 없습니다."
+                )
+            if self_trigger_mask != 0:
+                raise ValueError(
+                    "Software Random에서는 [Digitizer] SelfTriggerMask를 0으로 설정해야 합니다."
+                )
+        elif ext_trigger == 0 and self_trigger == 0:
+            raise ValueError("외부 트리거와 자체 트리거를 동시에 끌 수 없습니다.")
+        if self_trigger_mask & ~channel_mask:
+            raise ValueError(
+                "[Digitizer] SelfTriggerMask는 ChannelMask의 부분집합이어야 합니다."
+            )
+        if self_trigger:
+            if self_trigger_mask == 0:
+                raise ValueError(
+                    "SelfTriggerMode=1이면 SelfTriggerMask에 채널을 하나 이상 "
+                    "선택해야 합니다."
+                )
+        else:
+            if self_trigger_mask != 0:
+                raise ValueError(
+                    "SelfTriggerMode=0이면 [Digitizer] SelfTriggerMask는 0이어야 합니다."
+                )
+
+        if pair_logic == "AND":
+            incomplete_pairs = [
+                f"CH{pair_start}/{pair_start + 1}"
+                for pair_start in range(0, 8, 2)
+                if ((self_trigger_mask >> pair_start) & 0x3) not in (0, 0x3)
+            ]
+            if incomplete_pairs:
+                raise ValueError(
+                    "AND는 완전한 인접 pair만 선택할 수 있습니다: "
+                    + ", ".join(incomplete_pairs)
+                    + ". 여러 pair를 선택하면 각 pair의 AND 결과는 서로 OR로 결합됩니다."
+                )
+        uses_mv_threshold = False
+        uses_target_offset = False
+        for ch in range(8):
+            if (channel_mask >> ch) & 1:
+                section = f"Channel_{ch}"
+                channel_data = config_data.get(section, {})
+                try:
+                    offset_settings = parse_dc_offset_settings(
+                        channel_data.get("DCOffsetMode"),
+                        channel_data.get("BaselineTargetPercent"),
+                        channel_data.get("DCOffset"),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"[{section}] DC offset 설정 오류: {exc}"
+                    ) from exc
+                uses_target_offset = (
+                    uses_target_offset
+                    or offset_settings.mode == DC_OFFSET_MODE_TARGET
+                )
+                has_absolute = (
+                    section in config_data
+                    and "TriggerThreshold" in config_data[section]
+                )
+                has_mv = (
+                    section in config_data
+                    and "TriggerThresholdMv" in config_data[section]
+                )
+                participates_in_trigger = bool(
+                    self_trigger and ((self_trigger_mask >> ch) & 1)
+                )
+                if has_absolute and has_mv:
+                    raise ValueError(
+                        f"[{section}] TriggerThreshold(legacy)와 TriggerThresholdMv 중 "
+                        "하나만 설정해야 합니다."
+                    )
+                if (
+                    participates_in_trigger
+                    and offset_settings.mode == DC_OFFSET_MODE_TARGET
+                    and has_absolute
+                ):
+                    raise ValueError(
+                        f"[{section}] TargetBaseline 모드의 self-trigger 채널은 "
+                        "baseline 이동 후 stale해지는 absolute TriggerThreshold를 "
+                        "사용할 수 없습니다. TriggerThresholdMv를 사용하세요."
+                    )
+                if participates_in_trigger and not has_absolute and not has_mv:
+                    raise ValueError(
+                        f"[{section}] self-trigger 채널에는 TriggerThreshold 또는 "
+                        "TriggerThresholdMv가 필요합니다."
+                    )
+                if not has_absolute and not has_mv:
+                    continue
+                if has_mv:
+                    uses_mv_threshold = (
+                        uses_mv_threshold or participates_in_trigger
+                    )
+                    requested_mv = required_float(
+                        section, "TriggerThresholdMv", 0.0,
+                        float(input_range_mv)
+                    )
+                    try:
+                        millivolts_to_adc_delta(
+                            requested_mv, input_range_mv, adc_bits
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"[{section}] TriggerThresholdMv={requested_mv}: {exc}"
+                        ) from exc
+                else:
+                    required_int(section, "TriggerThreshold", 0, (1 << adc_bits) - 1)
+
+        if uses_mv_threshold:
+            settling_ms = required_int(
+                "TriggerCalibration", "SettlingTimeMs", 0, 600000
+            )
+            settling_timeout_ms = required_int(
+                "TriggerCalibration", "SettlingTimeoutMs", 1, 600000
+            )
+            if settling_timeout_ms <= settling_ms:
+                raise ValueError(
+                    "[TriggerCalibration] SettlingTimeoutMs는 "
+                    "SettlingTimeMs보다 커야 합니다."
+                )
+            required_int(
+                "TriggerCalibration", "MeasurementEvents", 1, 10000
+            )
+            required_float(
+                "TriggerCalibration", "StabilityToleranceAdc", 0.0,
+                float(1 << adc_bits)
+            )
+            required_int(
+                "TriggerCalibration", "StableMeasurements", 2, 100
+            )
+
+        if uses_target_offset or "DCOffsetCalibration" in config_data:
+            tolerance_raw = config_data.get("DCOffsetCalibration", {}).get(
+                "TargetTolerancePercent", "0.5"
+            )
+            try:
+                target_tolerance = float(tolerance_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "실수가 아닌 설정값입니다: [DCOffsetCalibration] "
+                    f"TargetTolerancePercent={tolerance_raw}"
+                ) from exc
+            if not math.isfinite(target_tolerance) or not (
+                0.0 < target_tolerance <= 10.0
+            ):
+                raise ValueError(
+                    "설정값 범위 오류: [DCOffsetCalibration] "
+                    "TargetTolerancePercent는 0보다 크고 10 이하여야 합니다."
+                )
+            optional_int(
+                "DCOffsetCalibration", "MaxAdjustmentIterations",
+                8, 1, 32,
+            )
+            optional_int(
+                "DCOffsetCalibration", "DacBusyTimeoutMs",
+                1000, 1, 60000,
+            )
+            step_settling_ms = optional_int(
+                "DCOffsetCalibration", "StepSettlingTimeMs",
+                3000, 0, 600000,
+            )
+            trigger_settling_timeout_ms = optional_int(
+                "TriggerCalibration", "SettlingTimeoutMs",
+                15000, 1, 600000,
+            )
+            if (
+                uses_target_offset
+                and step_settling_ms >= trigger_settling_timeout_ms
+            ):
+                raise ValueError(
+                    "[DCOffsetCalibration] StepSettlingTimeMs는 "
+                    "[TriggerCalibration] SettlingTimeoutMs보다 작아야 합니다."
+                )
+
+        default_baseline = min(
+            150, post_trigger_truth.actual_pre_samples
+        )
+        baseline_samples = optional_int(
+            "SoftwareDSP", "BaselineSamples", default_baseline,
+            1, record_length,
+        )
+        if baseline_samples > post_trigger_truth.actual_pre_samples:
+            raise ValueError(
+                "[SoftwareDSP] BaselineSamples가 실제 pre-trigger 구간 "
+                f"{post_trigger_truth.actual_pre_samples} samples를 초과합니다."
+            )
+        for gate_key in ("ShortGate", "LongGate"):
+            optional_int(
+                "SoftwareDSP",
+                gate_key,
+                None,
+                1,
+                MAX_PROVENANCE_GATE_SAMPLES,
+            )
+
+        pulse_start_threshold_raw = config_data.get("SoftwareDSP", {}).get(
+            "PulseStartThresholdAdc"
+        )
+        if pulse_start_threshold_raw is not None:
+            try:
+                pulse_start_threshold_adc = float(pulse_start_threshold_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "실수가 아닌 설정값입니다: [SoftwareDSP] "
+                    f"PulseStartThresholdAdc={pulse_start_threshold_raw}"
+                ) from exc
+            maximum_threshold_adc = float((1 << adc_bits) - 1)
+            if not (
+                math.isfinite(pulse_start_threshold_adc)
+                and 0.0
+                <= pulse_start_threshold_adc
+                <= maximum_threshold_adc
+            ):
+                raise ValueError(
+                    "설정값 범위 오류: [SoftwareDSP] "
+                    f"PulseStartThresholdAdc={pulse_start_threshold_raw} "
+                    f"(허용 0..{maximum_threshold_adc:g})"
+                )
+
+        self.config_uses_mv_threshold = uses_mv_threshold
+        self.validated_storage_settings = {
+            "record_length": record_length,
+            "channel_mask": channel_mask,
+            "minimum_free_bytes": minimum_free_mib * 1024 * 1024,
+            "stop_free_bytes": stop_free_mib * 1024 * 1024,
+        }
+        self.validated_config_text = "".join(config_lines)
+
+        return config_full
+
+    def recovery_active(self):
+        process = self.recovery_process
+        return bool(process and (process.isRunning() or process.has_pending_work()))
+
+    def _daq_active(self):
+        process = self.daq_process
+        return bool(process and (process.isRunning() or process.has_pending_work()))
+
+    def recover_digitizer(self):
+        if self.recovery_active() or self._daq_active() or not self.btn_start.isEnabled():
+            self.append_log("[Recovery] DAQ 또는 정상화 작업이 진행 중입니다. 종료 후 실행하십시오.")
+            return
+        snapshot = None
+        try:
+            config_path = resolve_path(self.proj_dir, self.config_input.text().strip())
+            self.ensure_selected_config_is_saved(config_path)
+            executable, frontend_identity, config_identity = self.validate_runtime_artifacts(config_path)
+            with open(config_path, "rb") as config_file:
+                payload = config_file.read()
+            if hashlib.sha256(payload).hexdigest() != config_identity["sha256"]:
+                raise ValueError("정상화 준비 중 설정 파일이 변경되었습니다. 다시 실행하십시오.")
+            with tempfile.NamedTemporaryFile(prefix="cpnr-recovery-", suffix=".conf", delete=False) as config_file:
+                snapshot = config_file.name
+                config_file.write(payload)
+            process = ProcessManager(
+                [executable, "--recover-digitizer", "-c", snapshot],
+                cwd=self.proj_dir,
+                expected_hashes={executable: frontend_identity["sha256"],
+                                 snapshot: config_identity["sha256"]},
+                graceful_stop_timeout_sec=2.0,
+            )
+        except (OSError, ValueError) as exc:
+            if snapshot:
+                os.unlink(snapshot)
+            self.append_log(f"[Recovery] 정상화를 시작하지 못했습니다: {exc}")
+            return
+        self._recovery_config = snapshot
+        self._recovery_timed_out = False
+        self.recovery_process = process
+        self.btn_start.setEnabled(False)
+        self.btn_recover.setEnabled(False)
+        self.btn_recover.setText("정상화 중…")
+        process.log_signal.connect(self.append_log)
+        process.finished_signal.connect(self._recovery_result)
+        process.finished.connect(self._recovery_thread_finished)
+        self.append_log("[Recovery] 장비 수집 정지·리셋·버퍼 정리를 시작합니다. 저장된 파일은 유지됩니다.")
+        process.start()
+        self.recovery_timer.start(30000)
+
+    def _timeout_recovery(self):
+        if self.recovery_active():
+            self._recovery_timed_out = True
+            self.append_log("[Recovery] 응답 제한시간을 초과했습니다. 정상화 프로세스를 종료합니다.")
+            self.recovery_process.stop(auto_force=True)
+
+    def _recovery_result(self, returncode):
+        self.recovery_timer.stop()
+        if returncode == 0 and not self._recovery_timed_out:
+            self.append_log("[Recovery] 정상 대기 상태를 확인했습니다. 새 DAQ Run을 시작할 수 있습니다.")
+            self.hardware_led_signal.emit({"PLL LOCK": 1, "BOARD READY": 1, "RUN": 0})
+        else:
+            self.append_log(
+                f"[Recovery] 정상화 실패 (exit={returncode}). 정상 상태를 확인하지 못했습니다. "
+                "위 오류와 USB 연결·장비 전원을 확인하십시오."
+            )
+            self.hardware_led_signal.emit({})
+
+    def _recovery_thread_finished(self):
+        self.recovery_timer.stop()
+        if self._recovery_config:
+            try:
+                os.unlink(self._recovery_config)
+            except OSError as exc:
+                self.append_log(f"[Recovery] 임시 설정 정리 실패: {exc}")
+            self._recovery_config = None
+        self.btn_recover.setText("디지타이저 상태 정상화")
+        self.restore_run_controls()
+        self.recovery_finished_signal.emit()
+
     def start_daq_sequence(self):
+        if self.recovery_active():
+            self.append_log("[Recovery] 정상화가 완료된 뒤 DAQ를 시작하십시오.")
+            return
+        try:
+            self.validated_config_full = self.validate_config_before_start()
+            self.ensure_selected_config_is_saved(self.validated_config_full)
+            validate_stop_condition(
+                self.combo_stop_cond.currentIndex(),
+                self.spin_events.value(),
+                self.spin_time.value(),
+            )
+            storage_plan = self._build_storage_plan(
+                settings=self.validated_storage_settings,
+                enforce=True,
+            )
+            self._show_storage_plan(storage_plan)
+            if self.combo_mode.currentIndex() == 2 and self.config_uses_mv_threshold:
+                raise ValueError(
+                    "Auto Threshold Scan은 legacy absolute ADC threshold 전용입니다. "
+                    "채널별 measured-baseline mV calibration 설정에서는 안전하지 않아 "
+                    "실행을 차단했습니다."
+                )
+            executable, frontend_identity, config_identity = \
+                self.validate_runtime_artifacts(self.validated_config_full)
+            self.validated_frontend_path = executable
+        except (ValueError, OSError) as exc:
+            message = f"DAQ를 시작하지 않았습니다.\n\n{exc}"
+            self.append_log(f"[Config Error] {exc}")
+            QMessageBox.critical(self, "Invalid DAQ Configuration", message)
+            return
+
         self.current_run_no = self.spin_run_no.value()
+        self.stop_requested = False
+
+        self.append_log(
+            f"[Runtime] Frontend: {identity_summary(frontend_identity)}"
+        )
+        self.append_log(
+            f"[Runtime] Source config: {identity_summary(config_identity)}"
+        )
+        self.append_log(
+            f"[Storage Plan] {self._storage_log_summary(storage_plan)}"
+        )
         
         self.save_settings()
         self.base_output_path = self.output_input.text()
@@ -409,12 +1580,59 @@ class DaqTab(QWidget):
             self.total_batches = len(self.scan_values)
 
         self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
+        self.btn_recover.setEnabled(False)
         self.combo_mode.setEnabled(False); self.combo_stop_cond.setEnabled(False)
         self.spin_run_no.setEnabled(False)
         
-        self.run_single_batch()
+        self.launch_current_batch()
+
+    def restore_run_controls(self):
+        self.btn_start.setEnabled(not self.recovery_active())
+        self.btn_recover.setEnabled(not self.recovery_active())
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop DAQ")
+        self.combo_mode.setEnabled(True)
+        self.combo_stop_cond.setEnabled(True)
+        self.spin_run_no.setEnabled(True)
+
+    def launch_current_batch(self):
+        """Launch one batch and recover the GUI on a fail-closed refusal."""
+
+        try:
+            self.run_single_batch()
+            return True
+        except (OSError, RuntimeError, ValueError, DatabaseError) as exc:
+            if self.current_run_id > 0:
+                try:
+                    self.db.mark_daq_launch_failed(
+                        self.current_run_id,
+                        str(exc),
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            self.current_run_context.get("raw_file")
+                            if self.current_run_context else None
+                        ),
+                    )
+                except Exception as db_exc:
+                    self.append_log(
+                        "[DB Error] launch failure 상태를 기록하지 못했습니다: "
+                        f"{db_exc}"
+                    )
+            self.total_batches = 0
+            self.current_run_context = None
+            self.append_log(f"[Launch Error] DAQ를 시작하지 않았습니다: {exc}")
+            QMessageBox.critical(
+                self,
+                "DAQ Launch Blocked",
+                "DAQ를 시작하지 않았습니다. 기존 run 산출물은 변경하지 "
+                f"않았습니다.\n\n{exc}",
+            )
+            self.restore_run_controls()
+            return False
 
     def run_single_batch(self):
+        self.current_run_id = -1
+        self.current_run_uuid = ""
         self.last_stats = {}
         self.val_batch.setText(f"{self.current_batch} / {self.total_batches}")
         
@@ -433,17 +1651,36 @@ class DaqTab(QWidget):
         out_file_full = os.path.abspath(os.path.join(self.proj_dir, output_file))
         os.makedirs(os.path.dirname(out_file_full), exist_ok=True)
 
-        config_path_str = self.config_input.text()
-        config_full = os.path.abspath(os.path.join(self.proj_dir, config_path_str))
+        remaining_segments = max(
+            1, self.total_batches - self.current_batch + 1
+        )
+        storage_plan = self._build_storage_plan(
+            output_path=out_file_full,
+            settings=self.validated_storage_settings,
+            segments=remaining_segments,
+            enforce=True,
+        )
+        self._show_storage_plan(storage_plan)
+        self.append_log(
+            f"[Storage Preflight] {self._storage_log_summary(storage_plan)}"
+        )
 
-        run_config_path_str = config_path_str
+        config_full = self.validated_config_full
+        run_config_content = self.validated_config_text
         if mode == 2:
-            with open(config_full, 'r') as f: content = f.read()
-            content = re.sub(r'TriggerThreshold\s*=\s*\d+', f'TriggerThreshold={current_th}', content)
-            temp_scan_path = os.path.join(self.proj_dir, "config", f"temp_scan_th{current_th}.conf")
-            with open(temp_scan_path, 'w') as f: f.write(content)
-            run_config_path_str = os.path.relpath(temp_scan_path, self.proj_dir)
+            run_config_content, replacement_count = re.subn(
+                r'(?m)^(\s*TriggerThreshold\s*=\s*)[+-]?[0-9]+\s*$',
+                rf'\g<1>{current_th}',
+                run_config_content
+            )
+            if replacement_count == 0:
+                raise RuntimeError("검증된 설정에서 TriggerThreshold를 갱신하지 못했습니다.")
             self.append_log(f"\n[SCAN AUTOMATION] Target Threshold updated to {current_th} ADC.")
+
+        config_snapshot_path, metadata_path = sidecar_paths(out_file_full)
+        snapshot_identity = create_run_config_snapshot(
+            out_file_full, run_config_content
+        )
 
         current_env_data = {
             "Operator": self.operator_input.text().strip(),
@@ -452,49 +1689,269 @@ class DaqTab(QWidget):
         }
         if self.env_data_provider: current_env_data.update(self.env_data_provider())
 
-        self.current_run_id = self.db.record_run_start(output_file, current_env_data, config_full)
+        segment_kind = {
+            0: "single", 1: "batch", 2: "threshold_scan"
+        }[mode]
+        self.current_run_id = self.db.record_run_start(
+            str(out_file_full),
+            current_env_data,
+            str(config_snapshot_path),
+            run_number=self.current_run_no,
+            segment_kind=segment_kind,
+            segment_index=self.current_batch,
+            metadata_path=str(metadata_path),
+        )
+        self.current_run_uuid = self.db.get_run_uuid(self.current_run_id)
         self.append_log(f"\n========== [ Batch/Scan {self.current_batch}/{self.total_batches} Started ] ==========")
-        self.append_log(f"--- Output: {output_file} | DB ID: {self.current_run_id} ---")
-        
-        exe_path = os.path.join(self.bin_dir, "frontend_dt5730")
-        cmd = [exe_path, "-c", run_config_path_str, "-o", output_file]
-        
-        stop_idx = self.combo_stop_cond.currentIndex()
-        if stop_idx == 1 and self.spin_events.value() > 0:
-            cmd.extend(["-n", str(self.spin_events.value())])
-        elif stop_idx == 2 and self.spin_time.value() > 0:
-            cmd.extend(["-t", str(self.spin_time.value())])
+        self.append_log(f"--- Output: {out_file_full} | DB ID: {self.current_run_id} ---")
+        self.append_log(
+            f"[Runtime] Config snapshot: {identity_summary(snapshot_identity)}"
+        )
+        self.append_log(f"[Runtime] Metadata sidecar: {metadata_path}")
 
-        self.daq_process = ProcessManager(cmd, cwd=self.proj_dir)
+        stop_idx = self.combo_stop_cond.currentIndex()
+        max_events = 0
+        run_time_sec = 0
+        if stop_idx == 1 and self.spin_events.value() > 0:
+            max_events = self.spin_events.value()
+        elif stop_idx == 2 and self.spin_time.value() > 0:
+            run_time_sec = self.spin_time.value()
+
+        cmd = build_frontend_command(
+            self.validated_frontend_path,
+            config_snapshot_path,
+            out_file_full,
+            self.current_run_no,
+            metadata_path,
+            max_events=max_events,
+            run_time_sec=run_time_sec,
+        )
+
+        self.current_run_context = {
+            "raw_file": str(out_file_full),
+            "config_path": str(config_snapshot_path),
+            "metadata_path": str(metadata_path),
+            "run_number": self.current_run_no,
+            "source_config_path": str(config_full),
+            "frontend_path": self.validated_frontend_identity["path"],
+            "frontend_sha256": self.validated_frontend_identity["sha256"],
+            "config_sha256": snapshot_identity["sha256"],
+            "db_run_id": self.current_run_id,
+            "run_uuid": self.current_run_uuid,
+        }
+
+        self.daq_process = ProcessManager(
+            cmd,
+            cwd=self.proj_dir,
+            expected_hashes={
+                self.validated_frontend_path:
+                    self.validated_frontend_identity["sha256"],
+                str(config_snapshot_path): snapshot_identity["sha256"],
+            },
+            expected_absent_paths=frontend_expected_absent_paths(
+                out_file_full
+            ),
+        )
         self.daq_process.log_signal.connect(self.append_log)
         self.daq_process.stat_signal.connect(self.update_dashboard)
         
         self.daq_process.led_signal.connect(self.hardware_led_signal.emit)
         self.daq_process.temp_signal.connect(self.hardware_temp_signal.emit)
         self.daq_process.fatal_signal.connect(self.handle_fatal_error)
-        self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
+        self.daq_process.force_stop_available_signal.connect(
+            self._offer_daq_force_stop
+        )
+        self.daq_process.auto_force_escalated_signal.connect(
+            self._report_daq_auto_force_stop
+        )
         self.daq_process.finished_signal.connect(self.on_batch_finished)
+        # Emit the public completion signal only after on_batch_finished has
+        # persisted terminal state and recovered the controls.
+        self.daq_process.finished_signal.connect(self.daq_finished_signal.emit)
 
         self.daq_process.start()
 
     def on_batch_finished(self, returncode):
         self.append_log(f">>> Process Exited (Code: {returncode})")
-        if self.current_run_id > 0 and self.last_stats:
-            self.db.update_daq_summary(self.current_run_id, self.last_stats)
-            self.append_log("[DB] DAQ Summary successfully pushed to database.")
-
-        if self.current_batch < self.total_batches and returncode == 0:
-            self.current_batch += 1
-            self.run_single_batch()
+        context = (
+            dict(self.current_run_context)
+            if self.current_run_context else None
+        )
+        metadata_error = None
+        terminal_document = None
+        metadata_path = context.get("metadata_path") if context else None
+        if context and metadata_path and os.path.isfile(metadata_path):
+            try:
+                terminal_document, metadata_identity = (
+                    load_terminal_run_metadata(metadata_path, context)
+                )
+                context["metadata_sha256"] = metadata_identity["sha256"]
+                context["metadata_exists"] = True
+                context["terminal_acquisition_status"] = (
+                    terminal_document["acquisition_status"]
+                )
+                self.append_log(
+                    "[Runtime] Identity-validated terminal metadata: "
+                    f"{identity_summary(metadata_identity)}"
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                metadata_error = str(exc)
+                context["metadata_exists"] = bool(
+                    metadata_path and os.path.isfile(metadata_path)
+                )
+                self.append_log(
+                    "[Provenance Error] Canonical terminal "
+                    f"metadata를 신뢰할 수 없습니다: {metadata_path} ({exc})"
+                )
+        elif not context:
+            metadata_error = "launched frontend has no in-memory run context"
         else:
-            self.append_log("\n========== [ All DAQ Sequences Completed ] ==========")
-            self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
-            self.combo_mode.setEnabled(True); self.combo_stop_cond.setEnabled(True)
-            self.spin_run_no.setEnabled(True)
+            context["metadata_exists"] = False
+            metadata_error = (
+                "canonical terminal metadata is missing; process outcome is "
+                "interrupted/unknown"
+            )
+
+        if terminal_document is not None:
+            terminal_status = terminal_document["acquisition_status"]
+            db_status = {
+                "completed": "daq_completed",
+                "failed": "daq_failed",
+                "cancelled": "daq_cancelled",
+            }[terminal_status]
+            if returncode != 0 or self.stop_requested:
+                self.append_log(
+                    "[Lifecycle] Terminal sidecar truth takes precedence over "
+                    f"return code/stop intent: status={terminal_status}, "
+                    f"exit={returncode}, stop_requested={self.stop_requested}."
+                )
+        elif (
+            self.daq_process
+            and getattr(
+                self.daq_process, "launch_cancelled_before_process", False
+            )
+        ):
+            db_status = "daq_cancelled"
+            metadata_error = "launch was cancelled before frontend creation"
+        elif self.daq_process and not self.daq_process.process_started:
+            db_status = "daq_launch_failed"
+        else:
+            db_status = "daq_failed"
+            self.append_log(
+                "[Lifecycle Unknown] Frontend 종료를 terminal sidecar로 확인할 "
+                "수 없어 interrupted/unknown으로 보존합니다. Stop 요청 여부만으로 "
+                "cancelled를 추정하지 않습니다."
+            )
+        if self.current_run_id > 0:
+            try:
+                if db_status == "daq_completed":
+                    error_message = None
+                elif db_status == "daq_launch_failed":
+                    error_message = (
+                        self.daq_process.failure_message
+                        if self.daq_process else ""
+                    ) or metadata_error or "frontend launch failed"
+                elif terminal_document is not None:
+                    error_message = (
+                        terminal_document.get("failure_reason")
+                        or terminal_document.get("termination_reason")
+                    )
+                else:
+                    error_message = (
+                        metadata_error
+                        or (
+                            self.daq_process.failure_message
+                            if self.daq_process else ""
+                        )
+                        or f"frontend exit code {returncode}"
+                    )
+                if db_status == "daq_launch_failed":
+                    self.db.mark_daq_launch_failed(
+                        self.current_run_id,
+                        error_message,
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            context.get("raw_file") if context else None
+                        ),
+                    )
+                else:
+                    self.db.finalize_daq_run(
+                        self.current_run_id,
+                        status=db_status,
+                        exit_code=returncode,
+                        summary_dict=self.last_stats or None,
+                        metadata_path=metadata_path,
+                        error_message=error_message,
+                        run_uuid=self.current_run_uuid or None,
+                        output_file=(
+                            context.get("raw_file") if context else None
+                        ),
+                    )
+                self.append_log(
+                    f"[DB] DAQ lifecycle recorded: {db_status}."
+                )
+            except Exception as db_exc:
+                # Persistence is ancillary to safe process/UI finalization. A DB
+                # lock or disk failure must never strand disabled controls.
+                self.append_log(
+                    f"[DB Error] DAQ 종료 상태를 기록하지 못했습니다: {db_exc}"
+                )
+
+        if db_status == "daq_completed" and context:
+            self.runContextReady.emit(context)
+
+        if self.current_batch < self.total_batches and db_status == "daq_completed":
+            self.current_batch += 1
+            self.launch_current_batch()
+        else:
+            if db_status == "daq_completed":
+                self.append_log(
+                    "\n========== [ All DAQ Sequences Completed ] =========="
+                )
+            else:
+                self.append_log(
+                    "\n========== [ DAQ Sequence Ended: "
+                    f"{db_status} ] =========="
+                )
+            self.restore_run_controls()
             
             self.spin_run_no.setValue(self.current_run_no + 1)
             self.save_settings()
 
-    def stop_all(self):
-        self.total_batches = 0 
-        if self.daq_process and self.daq_process.isRunning(): self.daq_process.stop()
+    @pyqtSlot()
+    def _offer_daq_force_stop(self):
+        self.append_log(
+            "[Warning] DAQ가 graceful-stop 제한시간 안에 종료되지 않았습니다. "
+            "raw/metadata가 아직 finalize되지 않았을 수 있습니다. 계속 실행 중인 "
+            "child를 종료하려면 Force Stop DAQ를 누르십시오."
+        )
+        self.btn_stop.setText("Force Stop DAQ")
+        self.btn_stop.setEnabled(True)
+
+    @pyqtSlot()
+    def _report_daq_auto_force_stop(self):
+        self.append_log(
+            "[Warning] 애플리케이션 종료 제한시간이 지나 DAQ child를 자동 "
+            "force-stop했습니다. Terminal sidecar가 없으면 결과는 "
+            "interrupted/unknown입니다."
+        )
+        self.btn_stop.setEnabled(False)
+
+    def stop_all(self, auto_force=False):
+        if self.recovery_active():
+            self.recovery_process.stop(auto_force=True)
+        self.total_batches = 0
+        self.stop_requested = True
+        if self.daq_process:
+            if (
+                not auto_force
+                and hasattr(self.daq_process, "force_stop_is_available")
+                and self.daq_process.force_stop_is_available()
+            ):
+                self.btn_stop.setEnabled(False)
+                self.daq_process.force_stop()
+                return
+            # ProcessManager latches this even before QThread/Popen starts.
+            self.btn_stop.setText("Stopping DAQ…")
+            self.btn_stop.setEnabled(False)
+            self.daq_process.stop(auto_force=bool(auto_force))
